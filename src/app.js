@@ -15,6 +15,7 @@ const DEFAULTS = {
   goal_amount: 20000,
   goal_date: '2026-12-31',
   my_timezone: 'Africa/Johannesburg',
+  day_start_hour: 3, // my day rolls over at this hour (0 to 6), so work after midnight still counts for the day before
   call_window_start: 8,
   call_window_end: 21,
   email_daily_per_mailbox: 5,
@@ -22,7 +23,7 @@ const DEFAULTS = {
   call_script:
     'CALL SCRIPT (replace this with yours)\n\nOpening:\n\nHook (needs the verified competitor claim on this lead):\n\nQuestion:\n\nIf they say no:\n\nBooking line:',
 };
-const NUMERIC = ['daily_call_target', 'daily_dm_target', 'goal_amount', 'call_window_start', 'call_window_end', 'email_daily_per_mailbox'];
+const NUMERIC = ['daily_call_target', 'daily_dm_target', 'goal_amount', 'call_window_start', 'call_window_end', 'email_daily_per_mailbox', 'day_start_hour'];
 async function getSettings() {
   const c = db.cache();
   if (c && c.settings) return { ...c.settings };
@@ -39,6 +40,8 @@ async function setSetting(key, value) {
   const c = db.cache();
   if (c) c.settings = null;
 }
+/* MY day for an instant: the day rolls over at day_start_hour (default 3 AM), not midnight. Lead local time never goes through this. */
+const myDay = (date, s) => Lib.myDayKey(date, s.my_timezone, s.day_start_hour);
 const rawSetting = async (k) => { const r = await db.get('SELECT value FROM settings WHERE key = ?', k); return r ? r.value : null; };
 
 /* ---------------- helpers ---------------- */
@@ -57,7 +60,7 @@ const safeEqual = (a, b) => {
 
 const TEXT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'competitor_checked', 'external_id'];
 const ODDS_FIELDS = ['owner_odds', 'owner_odds_score'];
-const LEAD_COLS = [...TEXT_FIELDS, ...ODDS_FIELDS, 'phone_norm', 'email_norm', 'website_norm', 'name_city_key', 'status', 'next_followup', 'competitor_checked_date',
+const LEAD_COLS = [...TEXT_FIELDS, ...ODDS_FIELDS, 'rank_info', 'phone_norm', 'email_norm', 'website_norm', 'name_city_key', 'status', 'next_followup', 'competitor_checked_date',
   'opted_out', 'opt_out_date', 'opt_out_channel', 'is_demo', 'created_at', 'updated_at'];
 
 function sourceId(v) {
@@ -83,6 +86,33 @@ function normOddsScore(v) {
   const n = Number(t);
   return n >= 0 && n <= 100 ? n : null;
 }
+/* Ranking data: where the business ranks on Google Maps for one search, and the three businesses ahead of it. Comes from a scrape
+   (scripts/apply-rank-info.js, or the rank_info column of a CSV import). Shape:
+   { query, my_rank, total, top3: [{ rank, name, rating, reviews, phone }], source, checked_at }. Anything that does not fit is refused (null). */
+const posInt = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 1 && n <= 100000 ? n : null; };
+const shortText = (v, max) => { const t = v == null ? '' : String(v).trim(); return t ? t.slice(0, max) : null; };
+function cleanRankInfo(v) {
+  if (v == null || v === '') return null;
+  let o = v;
+  if (typeof v === 'string') { try { o = JSON.parse(v); } catch (e) { return null; } }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+  const query = shortText(o.query, 200);
+  const my_rank = posInt(o.my_rank), total = posInt(o.total);
+  if (!query || !my_rank) return null;
+  const top3 = (Array.isArray(o.top3) ? o.top3 : []).slice(0, 3).map((t) => {
+    const name = t && shortText(t.name, 200);
+    if (!name) return null;
+    const rating = Number(t.rating), reviews = Number(t.reviews);
+    return { rank: posInt(t.rank), name, rating: Number.isFinite(rating) && rating > 0 && rating <= 5 ? rating : null,
+      reviews: t.reviews != null && t.reviews !== '' && Number.isInteger(reviews) && reviews >= 0 ? reviews : null, phone: shortText(t.phone, 40) };
+  }).filter(Boolean);
+  const checked = shortText(o.checked_at, 10);
+  return { query, my_rank, total: total && total >= my_rank ? total : null, top3, source: shortText(o.source, 60), checked_at: checked && isDate(checked) ? checked : null };
+}
+const asObject = (v) => { if (v && typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return null; } } return v || null; };
+/* a value as it goes into a column: the ranking object travels as JSON text */
+const colValue = (row, c) => { const v = row[c]; if (v === undefined) return null; return c === 'rank_info' && v && typeof v === 'object' ? JSON.stringify(v) : v; };
+
 const ODDS_RANK_SQL = "CASE l.owner_odds WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 WHEN 'LOW' THEN 2 ELSE 3 END";
 const oddsRank = (o) => (o === 'HIGH' ? 0 : o === 'MEDIUM' ? 1 : o === 'LOW' ? 2 : 3);
 
@@ -93,6 +123,10 @@ function normaliseLead(input, base) {
   if ('owner_odds' in input) f.owner_odds = normOdds(input.owner_odds);
   if ('owner_odds_score' in input) f.owner_odds_score = normOddsScore(input.owner_odds_score);
   else if ('owner_odds' in input && !f.owner_odds) f.owner_odds_score = null; // clearing the odds clears the score with it
+  if ('rank_info' in input) {
+    f.rank_info = cleanRankInfo(input.rank_info);
+    if (!f.rank_info && input.rank_info != null && input.rank_info !== '') throw bad('Ranking data is not in the expected format.');
+  }
   if ('state' in input && f.state) f.state = Lib.normState(f.state);
   if ('source' in input) f.source = sourceId(f.source) || (f.source ? 'other' : null);
   if ('status' in input && input.status) {
@@ -122,7 +156,7 @@ function leadView(r) {
   if (!r) return null;
   const tz = Lib.tzForLead(r);
   const channels = r.channels ? String(r.channels).split(',').map((x) => { const [channel, n] = x.split(':'); return { channel, count: Number(n) }; }) : [];
-  return { ...r, channels, opted_out: !!r.opted_out, is_demo: !!r.is_demo, tz, tz_source: r.timezone ? 'set' : tz ? 'state' : null };
+  return { ...r, rank_info: asObject(r.rank_info), channels, opted_out: !!r.opted_out, is_demo: !!r.is_demo, tz, tz_source: r.timezone ? 'set' : tz ? 'state' : null };
 }
 const getLeadRow = (id) => db.get('SELECT * FROM leads WHERE id = ?', id);
 
@@ -184,7 +218,7 @@ async function insertLeads(list) {
     const part = rows.slice(i, i + CHUNK);
     const marks = part.map(() => '(' + LEAD_COLS.map(() => '?').join(',') + ')').join(',');
     const args = [];
-    for (const row of part) for (const c of LEAD_COLS) args.push(row[c] === undefined ? null : row[c]);
+    for (const row of part) for (const c of LEAD_COLS) args.push(colValue(row, c));
     const res = await db.run(`INSERT INTO leads(${LEAD_COLS.join(',')}) VALUES ${marks} RETURNING id`, ...args);
     for (const r of res.rows) ids.push(Number(r.id));
   }
@@ -194,7 +228,7 @@ const insertLead = async (f) => (await insertLeads([f]))[0];
 async function writeLead(id, f) {
   const row = { ...f, updated_at: nowIso() };
   const cols = LEAD_COLS.filter((c) => c !== 'created_at');
-  await db.run(`UPDATE leads SET ${cols.map((c) => c + ' = ?').join(', ')} WHERE id = ?`, ...cols.map((c) => (row[c] === undefined ? null : row[c])), id);
+  await db.run(`UPDATE leads SET ${cols.map((c) => c + ' = ?').join(', ')} WHERE id = ?`, ...cols.map((c) => colValue(row, c)), id);
 }
 
 /* ---------------- status + follow-up rules ---------------- */
@@ -206,7 +240,7 @@ function nextStatus(cur, outcome) {
   if (cur === 'not_interested') return ['replied', 'call_booked'].includes(target) ? target : cur;
   return Lib.STATUS_RANK[target] > Lib.STATUS_RANK[cur] ? target : cur;
 }
-const todayKey = async (now) => Lib.dayKey(now || new Date(), (await getSettings()).my_timezone);
+const todayKey = async (now) => myDay(now || new Date(), await getSettings());
 
 async function addContact(leadId, b, now) {
   const lead = await getLeadRow(leadId);
@@ -275,7 +309,8 @@ async function listLeads(q) {
   }[q.sort] || 'l.created_at DESC, l.id DESC';
   const limit = Math.min(Number(q.limit) || 200, 1000), offset = Number(q.offset) || 0;
   const rows = await db.all(LEAD_LIST_SQL + w + ' ORDER BY ' + sort + ' LIMIT ? OFFSET ?', ...args, limit, offset);
-  return { total, rows: rows.map(leadView) };
+  // the list stays light: the ranking object travels only with a single lead and with the call queue
+  return { total, rows: rows.map((r) => { const v = leadView(r); v.has_rank_info = !!v.rank_info; delete v.rank_info; return v; }) };
 }
 
 async function leadDetail(id) {
@@ -353,7 +388,7 @@ async function putDeal(id, b) {
 }
 
 /* ---------------- today / queue ---------------- */
-function leadLite(r, now, s) {
+function leadLite(r, now, s, forCall) {
   const tz = Lib.tzForLead(r);
   const w = Lib.okToCall(now, tz, s.call_window_start, s.call_window_end);
   return {
@@ -362,6 +397,8 @@ function leadLite(r, now, s) {
     status: r.status, next_followup: r.next_followup, tz, competitor_checked: r.competitor_checked, competitor_checked_date: r.competitor_checked_date,
     last_at: r.last_at, last_channel: r.last_channel, last_outcome: r.last_outcome, contact_count: r.contact_count,
     window: w,
+    // only the call queue needs these (the Open panel on the Calls page): the website link and the Maps ranking
+    ...(forCall ? { website: r.website || null, rank_info: asObject(r.rank_info) } : {}),
   };
 }
 const ACTIVE = "l.opted_out = 0 AND l.status NOT IN ('closed','not_interested')";
@@ -370,7 +407,7 @@ const intOr0 = (v) => { const n = Math.floor(Number(v)); return Number.isFinite(
 
 async function todayData(now, followLimit) {
   const s = await getSettings();
-  const today = Lib.dayKey(now, s.my_timezone);
+  const today = myDay(now, s);
   const progress = {
     today,
     calls: 0, calls_target: s.daily_call_target, dms: 0, dms_target: s.daily_dm_target,
@@ -397,7 +434,7 @@ async function todayData(now, followLimit) {
 /* Follow-ups page: everything due (or coming up), filterable by the channel of the last contact. */
 async function followupsData(now, q) {
   const s = await getSettings();
-  const today = Lib.dayKey(now, s.my_timezone);
+  const today = myDay(now, s);
   const soon = q.scope === 'soon';
   const cond = soon ? 'l.next_followup > ? AND l.next_followup <= ?' : 'l.next_followup <= ?';
   const args = soon ? [today, Lib.addDaysKey(today, 7)] : [today];
@@ -425,17 +462,17 @@ const withAdj = (auto, row) => ({
   calls: Math.max(0, auto.calls + row.calls_adj), reached: Math.max(0, auto.reached + row.reached_adj),
   owner: Math.max(0, auto.owner + row.owner_adj), good: Math.max(0, auto.good + row.good_adj),
 });
-async function callsOnDay(day, tz) {
+async function callsOnDay(day, s) {
   const mid = Date.parse(day + 'T00:00:00Z');
   const lo = new Date(mid - 36 * 3600000).toISOString(), hi = new Date(mid + 60 * 3600000).toISOString();
-  return (await db.all("SELECT outcome, \"at\" FROM contacts WHERE channel = 'call' AND \"at\" >= ? AND \"at\" <= ?", lo, hi)).filter((c) => Lib.dayKey(c.at, tz) === day);
+  return (await db.all("SELECT outcome, \"at\" FROM contacts WHERE channel = 'call' AND \"at\" >= ? AND \"at\" <= ?", lo, hi)).filter((c) => myDay(c.at, s) === day);
 }
 async function dayData(day, now) {
   const s = await getSettings();
   if (!isDate(day)) throw bad('Day must be a date.');
-  const auto = autoCounts(await callsOnDay(day, s.my_timezone));
+  const auto = autoCounts(await callsOnDay(day, s));
   const row = await dayRow(day);
-  const today = Lib.dayKey(now, s.my_timezone);
+  const today = myDay(now, s);
   return { day, today, is_today: day === today, auto, adj: { calls: row.calls_adj, reached: row.reached_adj, owner: row.owner_adj, good: row.good_adj },
     totals: withAdj(auto, row), verdict: row.verdict || '' };
 }
@@ -443,8 +480,8 @@ async function setDay(b, now) {
   const s = await getSettings();
   const day = b.day;
   if (!isDate(day)) throw bad('Day must be a date.');
-  if (day > Lib.dayKey(now, s.my_timezone)) throw bad('You cannot log a day that has not happened yet.');
-  const auto = autoCounts(await callsOnDay(day, s.my_timezone));
+  if (day > myDay(now, s)) throw bad('You cannot log a day that has not happened yet.');
+  const auto = autoCounts(await callsOnDay(day, s));
   const row = { ...(await dayRow(day)) };
   if (b.field) {
     if (!COUNT_FIELDS[b.field]) throw bad('Unknown counter.');
@@ -460,8 +497,7 @@ async function setDay(b, now) {
 /* the 7 most recent days with anything on them, newest first, with averages (like the Cold Call Tracker's "Last 7 Days") */
 async function dayHistory(now) {
   const s = await getSettings();
-  const tz = s.my_timezone;
-  const calls = (await db.all("SELECT outcome, \"at\" FROM contacts WHERE channel = 'call' AND \"at\" >= ?", new Date(now.getTime() - 120 * 86400000).toISOString())).map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
+  const calls = (await db.all("SELECT outcome, \"at\" FROM contacts WHERE channel = 'call' AND \"at\" >= ?", new Date(now.getTime() - 120 * 86400000).toISOString())).map((c) => ({ ...c, day: myDay(c.at, s) }));
   const days = new Set(calls.map((c) => c.day));
   const adjRows = await db.all('SELECT * FROM call_day');
   const adjBy = Object.fromEntries(adjRows.map((r) => [r.day, r]));
@@ -484,10 +520,9 @@ const OUTREACH = [
 ];
 async function outreachDay(day, now) {
   const s = await getSettings();
-  const tz = s.my_timezone;
   const mid = Date.parse(day + 'T00:00:00Z');
   const lo = new Date(mid - 36 * 3600000).toISOString(), hi = new Date(mid + 60 * 3600000).toISOString();
-  const rows = (await db.all("SELECT channel, outcome, \"at\" FROM contacts WHERE \"at\" >= ? AND \"at\" <= ? AND channel IN ('call','instagram_dm','facebook_dm','email')", lo, hi)).filter((c) => Lib.dayKey(c.at, tz) === day);
+  const rows = (await db.all("SELECT channel, outcome, \"at\" FROM contacts WHERE \"at\" >= ? AND \"at\" <= ? AND channel IN ('call','instagram_dm','facebook_dm','email')", lo, hi)).filter((c) => myDay(c.at, s) === day);
   const adjRows = Object.fromEntries((await db.all('SELECT key, adj FROM outreach_adj WHERE day = ?', day)).map((r) => [r.key, r.adj]));
   const callRow = await dayRow(day);
   const items = OUTREACH.map((o) => {
@@ -496,7 +531,7 @@ async function outreachDay(day, now) {
     const adj = o.key === 'call' ? callRow.calls_adj : adjRows[o.key] || 0;
     return { key: o.key, label: o.label, auto, adj, total: Math.max(0, auto + adj) };
   });
-  const today = Lib.dayKey(now, tz);
+  const today = myDay(now, s);
   return { day, today, is_today: day === today, items, total: items.reduce((n, i) => n + i.total, 0) };
 }
 async function setOutreach(b, now) {
@@ -504,7 +539,7 @@ async function setOutreach(b, now) {
   const o = OUTREACH.find((x) => x.key === b.key);
   if (!o) throw bad('Unknown counter.');
   if (!isDate(b.day)) throw bad('Day must be a date.');
-  if (b.day > Lib.dayKey(now, s.my_timezone)) throw bad('You cannot log a day that has not happened yet.');
+  if (b.day > myDay(now, s)) throw bad('You cannot log a day that has not happened yet.');
   if (o.key === 'call') { await setDay({ day: b.day, field: 'calls', value: b.value }, now); return outreachDay(b.day, now); }
   const cur = (await outreachDay(b.day, now)).items.find((i) => i.key === o.key);
   const value = intOr0(b.value);
@@ -515,19 +550,19 @@ async function setOutreach(b, now) {
 /* Calls page: the call queue and the numbers that matter for calling. */
 async function callsData(now, period, readyLimit) {
   const s = await getSettings();
-  const tz = s.my_timezone;
-  const today = Lib.dayKey(now, tz);
-  const cands = (await db.all(LEAD_LIST_SQL + ` WHERE ${CALL_ELIGIBLE} AND (l.next_followup IS NULL OR l.next_followup <= ?)`, today)).map((r) => leadLite(r, now, s));
+  const today = myDay(now, s);
+  const cands = (await db.all(LEAD_LIST_SQL + ` WHERE ${CALL_ELIGIBLE} AND (l.next_followup IS NULL OR l.next_followup <= ?)`, today)).map((r) => leadLite(r, now, s, true));
   // best owner odds first (HIGH, MEDIUM, LOW, none), and inside each group the same order as before
   const ready = cands.filter((l) => l.window.ok).sort((a, b) => oddsRank(a.owner_odds) - oddsRank(b.owner_odds) || a.window.minsLeft - b.window.minsLeft || a.id - b.id);
-  const later = cands.filter((l) => !l.window.ok && !l.window.unknown).sort((a, b) => a.window.minsUntilOpen - b.window.minsUntilOpen || a.id - b.id);
-  const noTz = cands.filter((l) => l.window.unknown);
+  const slim = ({ rank_info, website, ...rest }) => rest; // the rows below the fold do not open the panel
+  const later = cands.filter((l) => !l.window.ok && !l.window.unknown).sort((a, b) => a.window.minsUntilOpen - b.window.minsUntilOpen || a.id - b.id).map(slim);
+  const noTz = cands.filter((l) => l.window.unknown).map(slim);
 
   const per = ['today', 'week', 'month'].includes(period) ? period : 'today';
   const start = per === 'today' ? today : per === 'week' ? Lib.mondayOf(today) : Lib.addDaysKey(today, -29);
   const fromIso = new Date(now.getTime() - 40 * 86400000).toISOString();
   const calls = (await db.all("SELECT c.outcome, c.\"at\", l.state, l.timezone FROM contacts c JOIN leads l ON l.id = c.lead_id WHERE c.channel = 'call' AND c.\"at\" >= ?", fromIso))
-    .map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
+    .map((c) => ({ ...c, day: myDay(c.at, s) }));
   const adjBy = Object.fromEntries((await db.all('SELECT * FROM call_day WHERE day >= ?', Lib.addDaysKey(today, -40))).map((r) => [r.day, r]));
   const dayTot = (d) => {
     const lc = calls.filter((c) => c.day === d);
@@ -574,7 +609,7 @@ async function goalData(now) {
   const signed = await db.get('SELECT COALESCE(SUM(d.deal_value),0) AS v, COUNT(*) AS n FROM deals d WHERE d.signed_date IS NOT NULL');
   const dep = await db.get('SELECT COALESCE(SUM(deposit_amount),0) AS v FROM deals WHERE deposit_paid_date IS NOT NULL');
   const pipe = await db.get("SELECT COALESCE(SUM(d.deal_value),0) AS v, COUNT(*) AS n FROM deals d JOIN leads l ON l.id=d.lead_id WHERE d.signed_date IS NULL AND l.status IN ('call_booked','proposal_sent') AND l.opted_out=0");
-  const today = Lib.dayKey(now, s.my_timezone);
+  const today = myDay(now, s);
   const daysLeft = Math.max(0, Lib.daysBetween(today, s.goal_date));
   const remaining = Math.max(0, s.goal_amount - signed.v);
   return { amount: s.goal_amount, date: s.goal_date, signed: signed.v, signed_count: signed.n, deposits: dep.v, pipeline: pipe.v, pipeline_count: pipe.n,
@@ -584,13 +619,12 @@ async function goalData(now) {
 /* ---------------- stats ---------------- */
 async function statsData(now, days, weeks) {
   const s = await getSettings();
-  const tz = s.my_timezone;
-  const today = Lib.dayKey(now, tz);
+  const today = myDay(now, s);
   const startDay = Lib.addDaysKey(today, -(days - 1));
   const startWeek = Lib.addDaysKey(Lib.mondayOf(today), -7 * (weeks - 1));
   const fromIso = new Date(now.getTime() - (Math.max(days, weeks * 7) + 9) * 86400000).toISOString();
   const rows = (await db.all('SELECT c.id, c.lead_id, c.channel, c.outcome, c."at", l.source FROM contacts c JOIN leads l ON l.id = c.lead_id WHERE c."at" >= ?', fromIso))
-    .map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
+    .map((c) => ({ ...c, day: myDay(c.at, s) }));
   const blank = () => ({ calls: 0, dms: 0, groups: 0, emails: 0, texts: 0, replies: 0, booked: 0 });
   const bump = (o, c) => {
     if (c.channel === 'call') o.calls++;
@@ -663,14 +697,13 @@ async function saveSnapshot(b) {
 }
 async function emailData(now) {
   const s = await getSettings();
-  const tz = s.my_timezone;
-  const today = Lib.dayKey(now, tz);
+  const today = myDay(now, s);
   const rows = await db.all('SELECT id, taken_at, payload FROM email_snapshots ORDER BY id DESC LIMIT 2');
   const snap = rows[0] ? { ...JSON.parse(rows[0].payload), id: rows[0].id, taken_at: rows[0].taken_at } : null;
   const prev = rows[1] ? JSON.parse(rows[1].payload) : null;
   const avg = (p) => (p && p.mailboxes && p.mailboxes.length ? p.mailboxes.reduce((n, m) => n + (m.score || 0), 0) / p.mailboxes.length : null);
   const fromIso = new Date(now.getTime() - 40 * 86400000).toISOString();
-  const em = (await db.all("SELECT outcome, \"at\", mailbox FROM contacts WHERE channel = 'email' AND \"at\" >= ?", fromIso)).map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
+  const em = (await db.all("SELECT outcome, \"at\", mailbox FROM contacts WHERE channel = 'email' AND \"at\" >= ?", fromIso)).map((c) => ({ ...c, day: myDay(c.at, s) }));
   const totals = Object.fromEntries((await db.all("SELECT outcome, COUNT(*) AS n FROM contacts WHERE channel = 'email' GROUP BY outcome")).map((r) => [r.outcome, r.n]));
   const weekStart = Lib.addDaysKey(today, -6);
   const wk = em.filter((c) => c.day >= weekStart);
@@ -789,11 +822,11 @@ async function zapmailSync() {
     const prev = await db.get('SELECT payload FROM email_snapshots ORDER BY id DESC LIMIT 1');
     const old = prev ? JSON.parse(prev.payload) : {};
     const today = new Date();
-    const myTz = (await getSettings()).my_timezone;
+    const mySettings = await getSettings();
     const mailboxes = boxes.map((b) => {
       const sc = scores[b.id] || null;
       const startedDay = sc && sc.warmupStartedOn ? String(sc.warmupStartedOn).slice(0, 10) : null;
-      const age = startedDay ? Lib.daysBetween(startedDay, Lib.dayKey(today, myTz)) : null;
+      const age = startedDay ? Lib.daysBetween(startedDay, myDay(today, mySettings)) : null;
       const status = sc ? (age != null && age >= 21 ? 'Warmed up' : 'Warming up') : b.status === 'ACTIVE' ? 'Active' : String(b.status || '').replace(/_/g, ' ').toLowerCase().replace(/^./, (c) => c.toUpperCase());
       return { id: b.id, email: b.email, name: [b.firstName, b.lastName].filter(Boolean).join(' '), domain: b.domain, status, score: sc ? sc.warmupScore : null, score_max: 100,
         sent_30d: sc ? sc.sent : null, inbox_rate: sc && sc.inboxRate != null ? sc.inboxRate / 100 : null, warmup_started: startedDay };
@@ -827,7 +860,7 @@ async function zapmailStatus() {
 }
 
 /* ---------------- import ---------------- */
-const IMPORT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'external_id', 'owner_odds', 'owner_odds_score'];
+const IMPORT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'external_id', 'owner_odds', 'owner_odds_score', 'rank_info'];
 async function importPrepare(rows, defaults) {
   const seen = { phone: new Map(), site: new Map(), key: new Map() };
   const out = [];
@@ -835,6 +868,7 @@ async function importPrepare(rows, defaults) {
   rows.forEach((raw, i) => {
     const input = {};
     for (const k of IMPORT_FIELDS) if (raw[k] != null && String(raw[k]).trim() !== '') input[k] = raw[k];
+    if ('rank_info' in input && !cleanRankInfo(input.rank_info)) delete input.rank_info; // a bad optional cell is left out, like junk owner odds
     if (!input.source) input.source = defaults.source || 'other';
     if (!input.source_link && defaults.source_link) input.source_link = defaults.source_link;
     if (!input.batch && defaults.batch) input.batch = defaults.batch;
@@ -876,7 +910,7 @@ async function importPreview(b) {
   return {
     counts,
     rows: rows.map((r) => ({ i: r.i, status: r.status, reason: r.reason || null, file_dup_of: r.file_dup_of,
-      lead: { business_name: r.lead.business_name, owner_name: r.lead.owner_name, phone: r.lead.phone, email: r.lead.email, website: r.lead.website, city: r.lead.city, state: r.lead.state, trade: r.lead.trade, source: r.lead.source, owner_odds: r.lead.owner_odds || null, owner_odds_score: r.lead.owner_odds_score == null ? null : r.lead.owner_odds_score },
+      lead: { business_name: r.lead.business_name, owner_name: r.lead.owner_name, phone: r.lead.phone, email: r.lead.email, website: r.lead.website, city: r.lead.city, state: r.lead.state, trade: r.lead.trade, source: r.lead.source, owner_odds: r.lead.owner_odds || null, owner_odds_score: r.lead.owner_odds_score == null ? null : r.lead.owner_odds_score, has_rank_info: !!r.lead.rank_info },
       matches: (r.matches || []).map((m) => ({ id: m.lead.id, business_name: m.lead.business_name, city: m.lead.city, reasons: m.reasons })),
       optouts: (r.optouts || []).map((o) => ({ business_name: o.business_name, at: o.at })) })),
   };
@@ -905,6 +939,7 @@ async function importCommit(b) {
           // owner odds and its score go together: both fill in when the lead has no odds yet; the score alone fills in only when it belongs to the same odds
           if (target.owner_odds == null && r.lead.owner_odds != null) { patch.owner_odds = r.lead.owner_odds; if (r.lead.owner_odds_score != null) patch.owner_odds_score = r.lead.owner_odds_score; }
           else if (target.owner_odds != null && target.owner_odds === r.lead.owner_odds && target.owner_odds_score == null && r.lead.owner_odds_score != null) patch.owner_odds_score = r.lead.owner_odds_score;
+          if (target.rank_info == null && r.lead.rank_info) patch.rank_info = r.lead.rank_info; // ranking data only fills a lead that has none
           const merged = normaliseLead(patch, target);
           if (Object.keys(patch).length) { await writeLead(target.id, merged); res.updated++; } else res.skipped_duplicates++;
         } else res.skipped_duplicates++;
@@ -919,9 +954,9 @@ async function importCommit(b) {
 /* ---------------- export ---------------- */
 const BOM = '﻿';
 async function csvLeads() {
-  const cols = ['id', 'business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'owner_odds', 'owner_odds_score', 'status', 'next_followup', 'competitor_checked', 'competitor_checked_date', 'opted_out', 'opt_out_date', 'opt_out_channel', 'external_id', 'is_demo', 'created_at', 'updated_at'];
+  const cols = ['id', 'business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'owner_odds', 'owner_odds_score', 'status', 'next_followup', 'competitor_checked', 'competitor_checked_date', 'opted_out', 'opt_out_date', 'opt_out_channel', 'external_id', 'is_demo', 'created_at', 'updated_at', 'rank_info'];
   const rows = await db.all('SELECT * FROM leads ORDER BY id');
-  return Lib.toCSV([cols, ...rows.map((r) => cols.map((c) => r[c]))]);
+  return Lib.toCSV([cols, ...rows.map((r) => cols.map((c) => (c === 'rank_info' ? (r[c] ? JSON.stringify(asObject(r[c])) : '') : r[c])))]);
 }
 async function csvContacts() {
   const cols = ['id', 'lead_id', 'business_name', 'channel', 'outcome', 'direction', 'at', 'content', 'note', 'external_id', 'mailbox'];
@@ -1088,7 +1123,8 @@ route('GET', '/api/settings', () => getSettings());
 route('PUT', '/api/settings', async (c) => {
   for (const [k, v] of Object.entries(c.body)) {
     if (!(k in DEFAULTS)) continue;
-    if (NUMERIC.includes(k)) { const n = Number(v); if (!Number.isFinite(n) || n < 0) throw bad(k + ' must be a number.'); await setSetting(k, n); }
+    if (k === 'day_start_hour') { const n = v === '' || v == null ? NaN : Number(v); if (!Number.isInteger(n) || n < 0 || n > 6) throw bad('My day starts at must be a whole hour from 0 to 6.'); await setSetting(k, n); }
+    else if (NUMERIC.includes(k)) { const n = Number(v); if (!Number.isFinite(n) || n < 0) throw bad(k + ' must be a number.'); await setSetting(k, n); }
     else if (k === 'goal_date') { if (!isDate(v)) throw bad('Goal date must be a date.'); await setSetting(k, v); }
     else if (k === 'my_timezone') { try { Lib.parts(new Date(), v); } catch (e) { throw bad('Unknown time zone.'); } await setSetting(k, v); }
     else if (k === 'email_checklist') { let a; try { a = JSON.parse(v); if (!Array.isArray(a)) throw new Error('x'); } catch (e) { throw bad('The checklist must be a list.'); } await setSetting(k, JSON.stringify(a)); }
@@ -1174,9 +1210,9 @@ route('PUT', '/api/leads/:id/deal', (c) => putDeal(Number(c.params.id), c.body))
 route('GET', '/api/today', (c) => todayData(nowFrom(c.query), c.query.follow_limit));
 route('GET', '/api/followups', (c) => followupsData(nowFrom(c.query), c.query));
 route('GET', '/api/calls', (c) => callsData(nowFrom(c.query), c.query.period, c.query.ready_limit));
-route('GET', '/api/outreach/day', async (c) => outreachDay(c.query.day || Lib.dayKey(nowFrom(c.query), (await getSettings()).my_timezone), nowFrom(c.query)));
+route('GET', '/api/outreach/day', async (c) => outreachDay(c.query.day || myDay(nowFrom(c.query), await getSettings()), nowFrom(c.query)));
 route('PUT', '/api/outreach/day', (c) => setOutreach(c.body, nowFrom(c.query)));
-route('GET', '/api/calls/day', async (c) => dayData(c.query.day || Lib.dayKey(nowFrom(c.query), (await getSettings()).my_timezone), nowFrom(c.query)));
+route('GET', '/api/calls/day', async (c) => dayData(c.query.day || myDay(nowFrom(c.query), await getSettings()), nowFrom(c.query)));
 route('PUT', '/api/calls/day', (c) => setDay(c.body, nowFrom(c.query)));
 route('GET', '/api/calls/history', (c) => dayHistory(nowFrom(c.query)));
 route('GET', '/api/stats', (c) => statsData(nowFrom(c.query), Math.min(Number(c.query.days) || 14, 90), Math.min(Number(c.query.weeks) || 8, 26)));
@@ -1190,7 +1226,7 @@ route('GET', '/api/pipeline', async (c) => {
     counts[r.status]++;
     if (columns[r.status] && columns[r.status].length < 80) columns[r.status].push({ ...r, opted_out: !!r.opted_out });
   }
-  return { board: Lib.BOARD, columns, counts, goal: await goalData(now), today: Lib.dayKey(now, (await getSettings()).my_timezone) };
+  return { board: Lib.BOARD, columns, counts, goal: await goalData(now), today: myDay(now, await getSettings()) };
 });
 
 route('GET', '/api/email', (c) => emailData(nowFrom(c.query)));

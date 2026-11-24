@@ -389,3 +389,25 @@ details.more-fields > summary span.muted { font-size: 13px; }
 /* a text link that is a whole control on its own: at least 44 px tall on touch screens */
 @media (pointer: coarse), (max-width: 860px) { .linkbtn { display: inline-flex; align-items: center; min-height: 44px; } }
 details.keep > .fold-body { padding-top: 6px; }
+
+/* ---------- Calls page: the Open quick look ---------- */
+.btn.sm.compact { padding: 0 12px; min-width: 52px; }
+dialog.peek { width: min(460px, calc(100vw - 24px)); }
+.peek-list { margin: 0; display: grid; }
+.peek-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 48px; padding: 6px 0; border-bottom: 1px solid var(--rule); }
+.peek-row dt { flex: none; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; color: var(--muted); }
+.peek-row dd { margin: 0; min-width: 0; text-align: right; overflow-wrap: anywhere; }
+.peek-phone { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
+.peek-site { font-weight: 500; }
+.peek-maps { display: grid; gap: 10px; }
+.peek-sub { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; color: var(--ink-2); margin: 4px 0 0; }
+.peek-rankline { margin: 0; font-weight: 600; font-size: 16px; line-height: 1.4; }
+.peek-none { margin: 0; color: var(--muted); }
+.peek-comps { list-style: none; margin: 0; padding: 0; }
+.peek-comps li { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 0 8px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
+.peek-comps .pos { font-weight: 500; color: var(--ink-2); }
+.peek-comps .cname { font-weight: 600; }
+.peek-comps .meta { color: var(--muted); font-size: 13.5px; }
+@media (pointer: coarse), (max-width: 860px) { .peek a.mono, .peek-site { display: inline-flex; align-items: center; min-height: 44px; } }
+.peek-rank { display: grid; gap: 12px; }
+.peek-rank .peek-sub { margin-top: 6px; }

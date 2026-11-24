@@ -1,6 +1,7 @@
 /* Row builders shared by Today, Follow-ups and Calls. */
 import { h, Lib, icon, loc, statusChip, oddsChip, relDay, ago, telLink, windowMarker, timesLine, fmtDay, CHANNEL_ICON } from './ui.js';
 import { logPanel } from './log.js';
+import { openPeek } from './peek.js';
 
 /* Inline "Log" panel that opens under a row. ctx.open is a Set of lead ids with the panel open; ctx.onLogged runs after saving. */
 export function inlineLog(l, defaultChannel, ctx) {
@@ -33,7 +34,7 @@ export function followupRow(l, ctx) {
   return li;
 }
 
-/* One call-queue row: the lamp, who, their time and mine, Call and Log call. */
+/* One call-queue row: the lamp, who, their time and mine, Call, Log call and a small Open (a quick look panel, you stay on the Calls page). */
 export function queueRow(l, now, win, ctx) {
   const w = Lib.okToCall(now, l.tz, win.start, win.end);
   const li = h('li', { class: 'row' });
@@ -46,7 +47,8 @@ export function queueRow(l, now, win, ctx) {
       h('div', { class: 'meta' }, [l.owner_name, l.trade, loc(l)].filter(Boolean).join(' · ')),
       h('div', { class: 'meta' }, telLink(l.phone), l.competitor_checked_date ? ' · competitor checked ' + fmtDay(l.competitor_checked_date) : h('span', { class: 'err', style: 'font-weight:400' }, ' · no competitor check yet'))),
     h('div', { class: 'when' }, windowMarker(w), h('div', null, timesLine(l.tz, now, w))),
-    h('div', { class: 'act' }, callBtn, h('button', { class: 'btn ghost sm', type: 'button', onclick: () => toggleLog(l, li, 'call', ctx) }, 'Log call')));
+    h('div', { class: 'act' }, callBtn, h('button', { class: 'btn ghost sm', type: 'button', onclick: () => toggleLog(l, li, 'call', ctx) }, 'Log call'),
+      h('button', { class: 'btn ghost sm compact', type: 'button', 'aria-haspopup': 'dialog', 'aria-label': 'Open details for ' + l.business_name, dataset: { openLead: String(l.id) }, onclick: (e) => openPeek(l, new Date(), win, e.currentTarget) }, 'Open')));
   if (ctx.open.has(l.id)) li.append(inlineLog(l, 'call', ctx));
   return li;
 }

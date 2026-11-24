@@ -87,7 +87,7 @@ export function toast(message, opts) {
 /* ---------- dialogs ---------- */
 export function dialog(build, opts) {
   opts = opts || {};
-  const dlg = h('dialog', { class: opts.wide ? 'wide' : '' });
+  const dlg = h('dialog', { class: [opts.wide ? 'wide' : '', opts.className || ''].join(' ').trim() });
   const close = (v) => { dlg.close(v); };
   const inner = h('div', { class: 'dlg' });
   dlg.append(inner);
@@ -138,6 +138,9 @@ export async function api(method, path, body) {
 /* ---------- formatting ---------- */
 export const state = { settings: null };
 export const myTz = () => (state.settings && state.settings.my_timezone) || 'Africa/Johannesburg';
+/* MY day: rolls over at "My day starts at" (default 3 AM), not midnight. Use it for "today" on my side only, never for a lead's own clock. */
+export const myDayStart = () => (state.settings && state.settings.day_start_hour != null ? Number(state.settings.day_start_hour) : 3);
+export const myDay = (date) => Lib.myDayKey(date || new Date(), myTz(), myDayStart());
 const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 export function fmtDay(key) {

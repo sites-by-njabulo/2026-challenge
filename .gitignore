@@ -14,3 +14,7 @@ test/shots/
 
 # a real Zapmail snapshot holds your real mailbox addresses
 scripts/zapmail-snapshot-*.json
+
+# lead and ranking data built from his own scrapes stays on his machine
+scripts/rank-data/
+scripts/build-rank-data.js

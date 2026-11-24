@@ -1,4 +1,4 @@
-import { h, Lib, icon, api, toast, dialog, head, loc, statusChip, oddsChip, ODDS_CHOICES, relDay, ago, debounce, state, myTz, CHANNEL_ICON, tzLabel, channelChips, responsiveFold } from './ui.js';
+import { h, Lib, icon, api, toast, dialog, head, loc, statusChip, oddsChip, ODDS_CHOICES, relDay, ago, debounce, state, myTz, myDay, CHANNEL_ICON, tzLabel, channelChips, responsiveFold } from './ui.js';
 
 const FIELD_IDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'owner_odds'];
 
@@ -163,7 +163,7 @@ export async function renderLeads(view) {
 }
 
 function table(rows) {
-  const today = Lib.dayKey(new Date(), myTz());
+  const today = myDay();
   return h('div', { class: 'table-wrap' }, h('table', { class: 't cards' },
     h('thead', null, h('tr', null, ...['Business', 'Where', 'Status', 'Follow-up', 'Contacted via'].map((t) => h('th', null, t)))),
     h('tbody', null, ...rows.map((l) => h('tr', { class: 'click', tabindex: '0', onclick: (e) => { if (!e.target.closest('a')) location.hash = '#/lead/' + l.id; }, onkeydown: (e) => { if (e.key === 'Enter') location.hash = '#/lead/' + l.id; } },

@@ -17,6 +17,7 @@ const FIELDS = [
   ['external_id', 'External ID', false, ['externalid', 'id']],
   ['owner_odds', 'Owner odds (High, Medium, Low)', false, ['ownerodds', 'odds', 'ownerlikelihood', 'ownerchance']],
   ['owner_odds_score', 'Owner odds score (0 to 100)', false, ['owneroddsscore', 'oddsscore', 'ownerlikelihoodscore', 'ownerscore']],
+  ['rank_info', 'Google Maps ranking (from rank-info-import.csv)', false, ['rankinfo', 'ranking', 'maprank']],
 ];
 const STATUS_TEXT = { new: 'New', dup: 'Duplicate', dup_in_file: 'Repeat in file', optout: 'Opted out', invalid: 'Invalid' };
 

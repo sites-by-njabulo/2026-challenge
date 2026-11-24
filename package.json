@@ -10,8 +10,8 @@
     "test": "node --no-warnings test/flow.js",
     "test:ui": "node --no-warnings test/ui.js",
     "test:pg": "node --no-warnings test/via-pg.js flow && node --no-warnings test/via-pg.js ui",
-    "test:other": "node --no-warnings test/migrate.js && node --no-warnings test/config.js",
-    "test:all": "node --no-warnings test/flow.js && node --no-warnings test/ui.js && node --no-warnings test/via-pg.js flow && node --no-warnings test/via-pg.js ui && node --no-warnings test/migrate.js && node --no-warnings test/config.js"
+    "test:other": "node --no-warnings test/migrate.js && node --no-warnings test/config.js && node --no-warnings test/rank.js",
+    "test:all": "node --no-warnings test/flow.js && node --no-warnings test/ui.js && node --no-warnings test/via-pg.js flow && node --no-warnings test/via-pg.js ui && node --no-warnings test/migrate.js && node --no-warnings test/config.js && node --no-warnings test/rank.js"
   },
   "dependencies": {
     "pg": "^8.13.0"

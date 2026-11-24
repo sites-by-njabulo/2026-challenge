@@ -11,6 +11,7 @@ export async function renderSettings(view, ctx) {
   const goalDate = h('input', { class: 'input', id: 's-gdate', type: 'date', value: s.goal_date });
   const tz = h('select', { class: 'input', id: 's-tz' }, ...[...new Set([s.my_timezone, ...TZ_OPTIONS])].map((z) => h('option', { value: z }, z.replace(/_/g, ' '))));
   tz.value = s.my_timezone;
+  const dayStart = h('input', { class: 'input', id: 's-daystart', type: 'number', inputmode: 'numeric', min: '0', max: '6', step: '1', value: s.day_start_hour == null ? 3 : s.day_start_hour });
   const w0 = num('s-w0', s.call_window_start), w1 = num('s-w1', s.call_window_end);
   const script = h('textarea', { class: 'input', id: 's-script', rows: 12 }, s.call_script);
 
@@ -28,9 +29,10 @@ export async function renderSettings(view, ctx) {
     sec('Goal', h('div', { class: 'grid2' }, fld('s-goal', 'Goal amount (USD)', goalAmt, 'Counts deals marked signed.'), fld('s-gdate', 'Goal date', goalDate)),
       h('div', null, h('button', { class: 'btn', type: 'button', onclick: () => save({ goal_amount: goalAmt, goal_date: goalDate }, 'Goal saved') }, 'Save goal'))),
     sec('Time and calling window', fld('s-tz', 'My time zone', tz, 'Days, weeks and "today" use this zone.'),
+      fld('s-daystart', 'My day starts at (hour, 0 to 6)', dayStart, 'Work after midnight? Your counters keep counting the same day until this hour.'),
       h('div', { class: 'grid2' }, fld('s-w0', 'Calling opens (hour, 0 to 23)', w0), fld('s-w1', 'Calling closes (hour, 0 to 23)', w1)),
       h('p', { class: 'hint' }, 'Set to 8 and 21, which is 8 AM to 9 PM in the lead\'s local time. Some states set tighter hours, so check the rules for the states you call and narrow this if needed.'),
-      h('div', null, h('button', { class: 'btn', type: 'button', onclick: () => save({ my_timezone: tz, call_window_start: w0, call_window_end: w1 }, 'Saved') }, 'Save'))),
+      h('div', null, h('button', { class: 'btn', type: 'button', onclick: () => save({ my_timezone: tz, day_start_hour: dayStart, call_window_start: w0, call_window_end: w1 }, 'Saved') }, 'Save'))),
     sec('Call script', fld('s-script', 'Shown next to every lead', script, 'Keep your hook, the question, and what to say if they say no.'),
       h('div', null, h('button', { class: 'btn', type: 'button', onclick: () => save({ call_script: script }, 'Script saved') }, 'Save script'))),
     sec('Export', h('p', { class: 'hint' }, 'Your data lives in your Supabase database. Export anytime.'),

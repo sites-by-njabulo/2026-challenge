@@ -1,5 +1,5 @@
 /* Contact logging: channel + outcome buttons. Used on the Today rows and on the lead page. */
-import { h, Lib, icon, api, toast, fmtDay, CHANNEL_ICON, myTz, getMailboxes } from './ui.js';
+import { h, Lib, icon, api, toast, fmtDay, CHANNEL_ICON, myTz, myDay, getMailboxes } from './ui.js';
 
 const POSITIVE = ['booked', 'spoke_to_owner', 'replied', 'send_info'];
 const LS_CHANNEL = 'lt.channel';
@@ -10,7 +10,7 @@ function lastChannel(def) {
 function rememberChannel(c) { try { localStorage.setItem(LS_CHANNEL, c); } catch (e) { /* ignore */ } }
 
 function followupDate(choice, customDate) {
-  const today = Lib.dayKey(new Date(), myTz());
+  const today = myDay();
   if (choice === 'auto') return undefined;
   if (choice === 'none') return null;
   if (choice === 'date') return customDate || null;

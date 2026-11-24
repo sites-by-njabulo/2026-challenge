@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS mailbox TEXT;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS owner_odds TEXT;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS owner_odds_score INTEGER;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS rank_info JSONB;
 CREATE INDEX IF NOT EXISTS idx_contacts_lead ON contacts(lead_id, "at");
 CREATE INDEX IF NOT EXISTS idx_contacts_at ON contacts("at");
 CREATE TABLE IF NOT EXISTS deals (
@@ -70,10 +71,10 @@ const FIX_OLD_STATUS = "UPDATE leads SET status = 'follow_up' WHERE status = 'co
 const LOOK = `SELECT
   (SELECT COUNT(*) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace WHERE s.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity AND c.relname = ANY(?::text[])) AS secured,
   (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'contacts' AND column_name = 'mailbox') AS mailbox,
-  (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leads' AND column_name IN ('owner_odds', 'owner_odds_score')) AS odds`;
+  (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leads' AND column_name IN ('owner_odds', 'owner_odds_score', 'rank_info')) AS odds`;
 async function provision() {
   const look = await db.get(LOOK, TABLES);
-  if (!(look.secured === TABLES.length && look.mailbox === 1 && look.odds === 2)) await db.exec(DDL);
+  if (!(look.secured === TABLES.length && look.mailbox === 1 && look.odds === 3)) await db.exec(DDL);
   await db.run(FIX_OLD_STATUS);
 }
 

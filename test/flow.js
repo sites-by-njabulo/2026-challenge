@@ -586,6 +586,125 @@ async function wholeDatabaseText() {
     check('migration: Row Level Security stays on for leads, with no policies', (await db.get("SELECT relrowsecurity FROM pg_class WHERE relname = 'leads' AND relkind = 'r'")).relrowsecurity === true && (await db.all("SELECT * FROM pg_policies WHERE schemaname = 'public'")).length === 0, 1);
     await call('PATCH', '/api/leads/' + oddsIds['Odds Imp High'], { owner_odds: 'HIGH', owner_odds_score: 90 });
 
+    {
+    /* ---------- my day starts at 3 AM (day_start_hour), not midnight ---------- */
+    const SAST = 'Africa/Johannesburg';
+    check('day start: Lib.myDayKey keeps 00:00 to 02:59 SAST in the day before and starts the new day at 03:00', Lib.myDayKey('2027-03-09T23:30:00Z', SAST, 3) === '2027-03-09' && Lib.myDayKey('2027-03-10T00:59:59Z', SAST, 3) === '2027-03-09' && Lib.myDayKey('2027-03-10T01:00:00Z', SAST, 3) === '2027-03-10' && Lib.myDayKey('2027-03-10T01:05:00Z', SAST, 3) === '2027-03-10', 1);
+    check('day start: 0 is the old midnight behaviour, 6 and 9 are limited to 0 to 6, a missing hour behaves like 0', Lib.myDayKey('2027-03-09T23:30:00Z', SAST, 0) === '2027-03-10' && Lib.myDayKey('2027-03-10T03:59:00Z', SAST, 6) === '2027-03-09' && Lib.myDayKey('2027-03-10T04:00:00Z', SAST, 9) === '2027-03-10' && Lib.myDayKey('2027-03-09T23:30:00Z', SAST) === Lib.dayKey('2027-03-09T23:30:00Z', SAST), 1);
+    check('day start: Lib.dayKey itself is unchanged (a lead\'s own clock never moves)', Lib.dayKey('2027-03-09T23:30:00Z', SAST) === '2027-03-10' && Lib.dayKey('2027-03-10T00:30:00Z', 'America/New_York') === '2027-03-09', 1);
+    r = await call('GET', '/api/settings');
+    check('day start: the setting is there and defaults to 3', r.json.day_start_hour === 3, r.json.day_start_hour);
+    for (const bad of [7, -1, 2.5, 'abc', '']) {
+      r = await call('PUT', '/api/settings', { day_start_hour: bad });
+      if (r.status !== 400) check('day start: ' + JSON.stringify(bad) + ' is refused', false, r.status);
+    }
+    check('day start: values outside 0 to 6, fractions and text are refused and the setting stays 3', (await call('GET', '/api/settings')).json.day_start_hour === 3, 1);
+    const dsLead = (await call('POST', '/api/leads', { business_name: 'Day Start Test Plumbing', phone: '(555) 340-0001', city: 'Dayville', state: 'NY' })).json.lead;
+    const NOW_0230 = '2027-03-10T00:30:00Z';  // 02:30 SAST on 10 March: still the 9th with a 3 AM start
+    const NOW_1000 = '2027-03-10T08:00:00Z';  // 10:00 SAST on 10 March
+    const logAt = (channel, outcome, at, now) => call('POST', '/api/leads/' + dsLead.id + '/contacts?now=' + encodeURIComponent(now), { channel, outcome, at, followup: null });
+    await logAt('call', 'voicemail', '2027-03-09T23:30:00Z', NOW_1000);   // 01:30 SAST on the 10th
+    await logAt('call', 'voicemail', '2027-03-10T01:05:00Z', NOW_1000);   // 03:05 SAST on the 10th
+    await logAt('instagram_dm', 'sent', '2027-03-09T23:40:00Z', NOW_1000);
+    await logAt('email', 'sent', '2027-03-10T00:10:00Z', NOW_1000);
+    await logAt('facebook_dm', 'sent', '2027-03-10T01:30:00Z', NOW_1000);
+    const dayCalls = async (day, now) => (await call('GET', '/api/calls/day?day=' + day + '&now=' + encodeURIComponent(now))).json;
+    let d9 = await dayCalls('2027-03-09', NOW_1000), d10 = await dayCalls('2027-03-10', NOW_1000);
+    check('day start 3: a call at 01:30 SAST counts in the previous day, one at 03:05 in the new day', d9.auto.calls === 1 && d10.auto.calls === 1 && d9.is_today === false && d10.is_today === true, [d9.auto, d10.auto]);
+    let o9 = (await call('GET', '/api/outreach/day?day=2027-03-09&now=' + encodeURIComponent(NOW_1000))).json, o10 = (await call('GET', '/api/outreach/day?day=2027-03-10&now=' + encodeURIComponent(NOW_1000))).json;
+    const oc = (o, k) => o.items.find((i) => i.key === k).total;
+    check('day start 3: Reached out today counters follow it too (call, Instagram, Facebook, email)', oc(o9, 'call') === 1 && oc(o9, 'instagram_dm') === 1 && oc(o9, 'email') === 1 && oc(o9, 'facebook_dm') === 0 && oc(o10, 'call') === 1 && oc(o10, 'instagram_dm') === 0 && oc(o10, 'email') === 0 && oc(o10, 'facebook_dm') === 1, [o9.items.map((i) => i.total), o10.items.map((i) => i.total)]);
+    let t = (await call('GET', '/api/today?now=' + encodeURIComponent(NOW_0230))).json;
+    check('day start 3: at 02:30 SAST Today is still the previous day, with its counters', t.progress.today === '2027-03-09' && t.progress.calls === 1, [t.progress.today, t.progress.calls]);
+    t = (await call('GET', '/api/today?now=' + encodeURIComponent(NOW_1000))).json;
+    check('day start 3: at 10:00 SAST Today is the new day', t.progress.today === '2027-03-10' && t.progress.calls === 1, [t.progress.today, t.progress.calls]);
+    r = await call('GET', '/api/calls?now=' + encodeURIComponent(NOW_0230));
+    check('day start 3: the Calls page, dials meter and last 14 days use the same day', r.json.today === '2027-03-09' && r.json.dials_today === 1 && r.json.daily[13].day === '2027-03-09' && r.json.daily[13].dials === 1, [r.json.today, r.json.dials_today]);
+    r = await call('GET', '/api/stats?now=' + encodeURIComponent(NOW_0230));
+    check('day start 3: Stats days end on the same day', r.json.today === '2027-03-09' && r.json.daily[r.json.daily.length - 1].day === '2027-03-09', [r.json.today, r.json.daily.length && r.json.daily[r.json.daily.length - 1].day]);
+    r = await call('PUT', '/api/calls/day?now=' + encodeURIComponent(NOW_0230), { day: '2027-03-10', field: 'calls', value: 5 });
+    check('day start 3: at 02:30 SAST you cannot log the 10th yet ("has not happened yet"), but you can log the 9th', r.status === 400 && /not happened/.test(r.json.error) && (await call('PUT', '/api/calls/day?now=' + encodeURIComponent(NOW_0230), { day: '2027-03-09', field: 'calls', value: 4 })).status === 200, r.status);
+    await call('PUT', '/api/calls/day?now=' + encodeURIComponent(NOW_0230), { day: '2027-03-09', field: 'calls', value: 1 }); // put the adjustment back
+    r = await call('POST', '/api/leads/' + dsLead.id + '/contacts?now=' + encodeURIComponent(NOW_0230), { channel: 'call', outcome: 'no_answer' });
+    const wantFollow = Lib.addBizDays('2027-03-09', Lib.FOLLOWUP_DAYS.no_answer);
+    check('day start 3: a follow-up set automatically at 02:30 SAST counts from the previous day', r.status === 200 && r.json.lead.next_followup === wantFollow, [r.json.lead && r.json.lead.next_followup, wantFollow]);
+    // the lead's own clock is exact whatever the start hour is
+    const dsQ = (await call('POST', '/api/leads', { business_name: 'Day Start Queue Test', phone: '(555) 340-0002', city: 'Dayville', state: 'NY' })).json.lead;
+    const qAt = async () => (await call('GET', '/api/calls?ready_limit=400&now=' + encodeURIComponent(NOW_0230))).json.queue;
+    const q3 = await qAt();
+    const dsRow3 = [...q3.ready, ...q3.later].find((x) => x.id === dsQ.id);
+    r = await call('PUT', '/api/settings', { day_start_hour: 0 });
+    check('day start: it can be set to 0 (the old behaviour)', r.json.day_start_hour === 0, r.json);
+    const q0 = await qAt();
+    const dsRow0 = [...q0.ready, ...q0.later].find((x) => x.id === dsQ.id);
+    check('day start never moves a lead\'s local clock: the calling window, local time and the queue are the same with 3 and 0', dsRow3 && dsRow0 && JSON.stringify(dsRow3.window) === JSON.stringify(dsRow0.window) && dsRow3.window.local === dsRow0.window.local && q3.ready_total === q0.ready_total && q3.later_total === q0.later_total && q3.no_tz_total === q0.no_tz_total, [dsRow3 && dsRow3.window, dsRow0 && dsRow0.window]);
+    check('day start: the lead in New York is 19:30 local at 00:30 UTC and ready to call whichever day start is set', dsRow0 && dsRow0.window.ok === true && /7:30/.test(dsRow0.window.local), dsRow0 && dsRow0.window);
+    d9 = await dayCalls('2027-03-09', NOW_1000); d10 = await dayCalls('2027-03-10', NOW_1000);
+    check('day start 0 (old behaviour): the same history re-buckets by midnight with no migration (01:30 SAST is now the 10th)', d9.auto.calls === 0 && d10.auto.calls === 2, [d9.auto.calls, d10.auto.calls]);
+    o9 = (await call('GET', '/api/outreach/day?day=2027-03-09&now=' + encodeURIComponent(NOW_1000))).json; o10 = (await call('GET', '/api/outreach/day?day=2027-03-10&now=' + encodeURIComponent(NOW_1000))).json;
+    check('day start 0: Instagram and email at 01:30 and 02:10 SAST move to the 10th', oc(o9, 'instagram_dm') === 0 && oc(o9, 'email') === 0 && oc(o10, 'instagram_dm') === 1 && oc(o10, 'email') === 1, [o9.items.map((i) => i.total), o10.items.map((i) => i.total)]);
+    t = (await call('GET', '/api/today?now=' + encodeURIComponent(NOW_0230))).json;
+    check('day start 0: at 02:30 SAST Today is the new calendar day', t.progress.today === '2027-03-10', t.progress.today);
+    r = await call('PUT', '/api/calls/day?now=' + encodeURIComponent(NOW_0230), { day: '2027-03-10', field: 'calls', value: 2 });
+    check('day start 0: logging the 10th at 02:30 SAST is allowed again', r.status === 200, r.status);
+    r = await call('PUT', '/api/settings', { day_start_hour: 6 });
+    check('day start: 6 is accepted (the top of the range)', r.json.day_start_hour === 6, r.json);
+    r = await call('PUT', '/api/settings', { day_start_hour: '3' });
+    check('day start: back to 3 (a number typed as text is fine)', r.json.day_start_hour === 3 && typeof r.json.day_start_hour === 'number', r.json);
+    await call('DELETE', '/api/leads/' + dsLead.id + '?confirm=1');
+    await call('DELETE', '/api/leads/' + dsQ.id + '?confirm=1');
+    await db.run("DELETE FROM call_day WHERE day IN ('2027-03-09', '2027-03-10')");
+    }
+
+    /* ---------- ranking data (rank_info): where a lead ranks on Google Maps and who is ahead ---------- */
+    const RI = { query: 'plumber in Norristown PA', my_rank: 5, total: 79, top3: [{ rank: 1, name: 'Valdel Plumbing', rating: 4.8, reviews: 1094, phone: '+1 484-246-6888' }, { rank: 2, name: 'Ray Ross Plumbing & Heating', rating: 4.7, reviews: 68, phone: '+1 267-228-7287' }, { rank: 3, name: 'Plumb it Heat it Cool it', rating: 4.9, reviews: 858, phone: null }], source: 'google-maps-scrape', checked_at: '2026-11-25' };
+    r = await call('POST', '/api/leads', { business_name: 'Rank Test Plumbing', phone: '(555) 330-0001', website: 'https://ranktest.example', city: 'Queueville', state: 'NY', owner_name: 'Rex Rank', owner_odds: 'HIGH', rank_info: RI });
+    const rkLead = r.json.lead;
+    check('rank_info: a lead can be saved with ranking data and it comes back as an object', r.status === 200 && require('node:util').isDeepStrictEqual(rkLead.rank_info, RI), r.json);
+    r = await call('GET', '/api/leads/' + rkLead.id);
+    check('rank_info: the single lead endpoint returns it', r.json.lead.rank_info && r.json.lead.rank_info.my_rank === 5 && r.json.lead.rank_info.top3.length === 3 && r.json.lead.rank_info.top3[0].name === 'Valdel Plumbing', r.json.lead.rank_info);
+    r = await call('GET', '/api/leads?q=Rank%20Test%20Plumbing');
+    check('rank_info: the Leads list stays light (no ranking object, only a yes/no flag)', r.json.rows.length === 1 && !('rank_info' in r.json.rows[0]) && r.json.rows[0].has_rank_info === true, r.json.rows[0]);
+    r = await call('PATCH', '/api/leads/' + rkLead.id, { notes: 'edited' });
+    check('rank_info: saving other fields does not wipe it', r.json.lead.rank_info && r.json.lead.rank_info.my_rank === 5, r.json.lead.rank_info);
+    r = await call('PATCH', '/api/leads/' + rkLead.id, { rank_info: JSON.stringify({ ...RI, my_rank: 7 }) });
+    check('rank_info: ranking data can be sent as a JSON string too', r.status === 200 && r.json.lead.rank_info.my_rank === 7, r.json);
+    r = await call('PATCH', '/api/leads/' + rkLead.id, { rank_info: 'not json at all' });
+    check('rank_info: junk is refused with a clear message', r.status === 400 && /Ranking data/.test(r.json.error), [r.status, r.json]);
+    r = await call('PATCH', '/api/leads/' + rkLead.id, { rank_info: { query: 'x', my_rank: 0 } });
+    check('rank_info: a rank below 1 is refused', r.status === 400, r.status);
+    r = await call('GET', '/api/leads/' + rkLead.id);
+    check('rank_info: a refused save leaves the old data in place', r.json.lead.rank_info.my_rank === 7, r.json.lead.rank_info);
+    r = await call('PATCH', '/api/leads/' + rkLead.id, { rank_info: { ...RI, total: 3, top3: [...RI.top3, { rank: 4, name: 'Extra' }], checked_at: 'yesterday' } });
+    check('rank_info: a total below the rank, a fourth competitor and a bad date are cleaned', r.status === 200 && r.json.lead.rank_info.total === null && r.json.lead.rank_info.top3.length === 3 && r.json.lead.rank_info.checked_at === null, r.json.lead && r.json.lead.rank_info);
+    await call('PATCH', '/api/leads/' + rkLead.id, { rank_info: RI });
+    const tqr = (await call('GET', '/api/calls?ready_limit=400&now=' + encodeURIComponent(NOWQ))).json;
+    const qr = tqr.queue.ready.find((x) => x.id === rkLead.id);
+    check('rank_info: the call queue row carries the ranking and the website for the Open panel', qr && qr.rank_info && qr.rank_info.top3.length === 3 && qr.website === 'https://ranktest.example' && qr.owner_name === 'Rex Rank', qr);
+    check('rank_info: a queue row with no ranking has null, not a missing field', tqr.queue.ready.some((x) => x.id !== rkLead.id && x.rank_info === null), 1);
+    check('rank_info: the rows below the fold (outside hours, no time zone) stay slim', [...tqr.queue.later, ...tqr.queue.no_tz].every((x) => !('rank_info' in x) && !('website' in x)), 1);
+    check('rank_info: the ranking is not added to Follow-ups or Today', !('rank_info' in (await call('GET', '/api/followups?limit=1')).json.rows[0]) && JSON.stringify((await call('GET', '/api/today')).json).indexOf('top3') === -1, 1);
+    r = await call('POST', '/api/import/commit', { rows: [{ business_name: 'Rank Imp A', phone: '(555) 330-0002', city: 'Importville', state: 'PA', rank_info: JSON.stringify(RI) }, { business_name: 'Rank Imp B', phone: '(555) 330-0003', city: 'Importville', state: 'PA', rank_info: 'junk' }, { business_name: 'Rank Imp C', phone: '(555) 330-0004', city: 'Importville', state: 'PA' }], defaults: {}, mode: 'skip' });
+    const impR = await db.all("SELECT business_name, rank_info FROM leads WHERE business_name LIKE 'Rank Imp %' ORDER BY business_name");
+    check('rank_info: CSV import stores a good rank_info cell, ignores a junk one and keeps the row', r.json.added === 3 && impR[0].rank_info && impR[0].rank_info.my_rank === 5 && impR[1].rank_info === null && impR[2].rank_info === null, impR);
+    r = await call('POST', '/api/import/commit', { rows: [{ business_name: 'Rank Imp B', phone: '(555) 330-0003', rank_info: JSON.stringify(RI) }, { business_name: 'Rank Imp A', phone: '(555) 330-0002', rank_info: JSON.stringify({ ...RI, my_rank: 40 }) }], defaults: {}, mode: 'update' });
+    const impR2 = await db.all("SELECT business_name, rank_info FROM leads WHERE business_name LIKE 'Rank Imp %' ORDER BY business_name");
+    check('rank_info: import in fill-blank mode fills a lead with none and never overwrites one that has it', r.json.updated === 1 && impR2[1].rank_info && impR2[1].rank_info.my_rank === 5 && impR2[0].rank_info.my_rank === 5, impR2.map((x) => x.rank_info && x.rank_info.my_rank));
+    const exCsv = Lib.parseCSV((await call('GET', '/api/export/leads.csv')).buf.toString('utf8'));
+    const exH = exCsv[0], exRow = exCsv.find((x) => x[1] === 'Rank Test Plumbing');
+    check('rank_info: the leads CSV export has a rank_info column with the JSON, empty for leads without', exH.includes('rank_info') && JSON.parse(exRow[exH.indexOf('rank_info')]).my_rank === 5 && exCsv.find((x) => x[1] === 'Rank Imp C')[exH.indexOf('rank_info')] === '', exRow && exRow[exH.indexOf('rank_info')]);
+    r = await call('PATCH', '/api/leads/' + rkLead.id, { rank_info: '' });
+    check('rank_info: an empty value clears it', r.json.lead.rank_info === null, r.json.lead.rank_info);
+    await call('PATCH', '/api/leads/' + rkLead.id, { rank_info: RI });
+    await db.exec('ALTER TABLE leads DROP COLUMN rank_info');
+    resetSchemaFlag();
+    await call('GET', '/api/leads?limit=1');
+    const rcol = await db.get("SELECT data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leads' AND column_name = 'rank_info'");
+    check('rank_info: migration adds the column to an existing table (jsonb, optional)', rcol && rcol.data_type === 'jsonb' && rcol.is_nullable === 'YES' && (await db.get('SELECT COUNT(*) AS n FROM leads WHERE rank_info IS NOT NULL')).n === 0, rcol);
+    resetSchemaFlag();
+    await call('GET', '/api/leads?limit=1');
+    check('rank_info: running the migration again is harmless', (await db.get('SELECT COUNT(*) AS n FROM leads')).n > 10, 1);
+
     /* ---------- export, backup ---------- */
     r = await call('GET', '/api/export/all.zip');
     const zip = readZip(r.buf);

@@ -56,7 +56,7 @@ npm run test:all     everything below, one after the other
 npm test             API suite (test/flow.js) on PGlite
 npm run test:ui      browser suite (test/ui.js) on PGlite
 npm run test:pg      both of those again through the real `pg` package over a Postgres connection (the production path)
-npm run test:other   test/migrate.js (the copy-from-local script) and test/config.js (wrong-setup behaviour)
+npm run test:other   test/migrate.js (the copy-from-local script), test/config.js (wrong-setup behaviour) and test/rank.js (the ranking data scripts)
 ```
 
 `test/ui.js` also checks the phone: no sideways scroll at 360 and 390 wide, every control at least 44 px, every input 16 px or more, the manifest, icons, fonts and `vercel.json` cache rules. It needs Microsoft Edge and `puppeteer-core` (the path is at the top of that file).
@@ -70,6 +70,21 @@ Each lead can carry **Owner odds** (High, Medium or Low): how likely it is that 
 - The Calls queue lists High first, then Medium, then Low, then leads with no odds, and keeps the old order inside each group. Who is in the queue and every count stay exactly as before.
 - Import in "Fill blank fields" mode only fills odds on leads that have none (the score goes with it).
 - Database: two optional columns on `leads` (`owner_odds TEXT`, `owner_odds_score INTEGER`). `src/schema.js` adds them with `ADD COLUMN IF NOT EXISTS` on the first request after a deploy, so the existing Supabase table keeps all its rows. Nothing to run by hand.
+
+## Ranking data and the Open panel (Calls page)
+
+Each lead in the call queue has three buttons: **Call**, **Log call** and a small **Open**. Open shows a light quick look without leaving the Calls page: business name, owner (with the owner odds label), phone with a small Call button, city and state, a website link, where the business ranks on Google Maps, and the top 3 competitors (position, name, rating, reviews, phone). It has no script, no log form, no notes and no status controls. Esc or Close shuts it and focus goes back to the Open button.
+
+- Database: one optional column on `leads`, `rank_info JSONB` = `{ query, my_rank, total, top3: [{ rank, name, rating, reviews, phone }], source, checked_at }`. `src/schema.js` adds it with `ADD COLUMN IF NOT EXISTS` on the first request after a deploy, nothing to run by hand.
+- API: the call queue rows (`GET /api/calls`, ready rows only) carry `rank_info` and `website`, so Open is instant. `GET /api/leads/:id` returns `rank_info`; the Leads list only carries `has_rank_info`. It can be set with PATCH, with the `rank_info` column of a CSV import (a bad cell is ignored, "Fill blank fields" mode only fills leads that have none) and it is a column of the leads CSV export.
+- Where the numbers come from: a Google Maps scrape is the list of businesses in Google's result order for one search, so position in the file is the rank for that search. A business counts at its first position only, and supply stores, HVAC only, electricians and inspectors are skipped (franchises like Roto-Rooter count). The panel always says "Seen on the day the list was scraped" and warns that rankings move and shift by where the searcher is. It never invents a rank: with no data it says "No ranking data for this one yet."
+- Putting the data in (two steps, neither touches the database until you run step 2):
+  1. `node scripts/build-rank-data.js` reads the three raw scrapes (West Chester, Norristown, Coatesville) and writes `scripts/rank-data/`: `rank-lists.json`, `rank-matches.csv/.json` to look over, `rank-info-import.csv` for the Import page (mode "Fill blank fields") and `rank-info.sql` for the Supabase SQL editor.
+  2. `node scripts/apply-rank-info.js --dry-run` then `node scripts/apply-rank-info.js` (needs `DATABASE_URL`). It matches leads by phone digits (or the exact website page when the phone cannot decide), only writes `rank_info`, never overwrites a ranking that came from another source, and is safe to run again.
+
+## My day starts at 3 AM
+
+The Settings page has **My day starts at (hour, 0 to 6)**, default 3. Work after midnight and the counters keep counting the same day until that hour: a call at 01:30 SAST on the 26th counts in the 25th, one at 03:05 counts in the 26th. It applies to everything that is *my* day: Today and the date line, Reached out today (calls, Instagram, Facebook, emails), the dials meter, the scoreboard and its day arrows, Stats, follow-ups due, automatic follow-up dates, the goal countdown and the "cannot log a day that has not happened yet" check. It never touches a lead's own clock: the calling window, the lead's local time and the pick-up hours use the lead's real time zone. Set it to 0 for the old midnight behaviour. Nothing is stored per day, so past history simply re-buckets by the new rule, no migration. In code: `Lib.myDayKey(date, tz, startHour)`, while `Lib.dayKey` is unchanged.
 
 ## Rules built in (unchanged)
 

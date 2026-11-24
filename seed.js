@@ -11,9 +11,9 @@ const day = (offsetDays, hour, min) => {
   const d = new Date(); d.setUTCDate(d.getUTCDate() + offsetDays); d.setUTCHours(hour, min || 0, 0, 0); return d.toISOString();
 };
 const LEADS = [
-  { business_name: 'Ridgeline Roofing', owner_name: 'Dale Whitaker', phone: '(615) 555-0142', email: 'dale@ridgelineroofing.example', website: 'ridgelineroofing.example', city: 'Nashville', state: 'TN', trade: 'Roofer', source: 'google_maps', source_link: 'https://maps.example/ridgeline', batch: 'Demo roofers', competitor_checked: 'Summit Roof Pros ranks #1 for "roof repair Nashville"', competitor_checked_date: Lib.dayKey(new Date(), 'Africa/Johannesburg'), notes: 'Demo lead. Owner answers his own phone.' },
+  { business_name: 'Ridgeline Roofing', owner_name: 'Dale Whitaker', phone: '(615) 555-0142', email: 'dale@ridgelineroofing.example', website: 'ridgelineroofing.example', city: 'Nashville', state: 'TN', trade: 'Roofer', source: 'google_maps', source_link: 'https://maps.example/ridgeline', batch: 'Demo roofers', competitor_checked: 'Summit Roof Pros ranks #1 for "roof repair Nashville"', competitor_checked_date: Lib.myDayKey(new Date(), 'Africa/Johannesburg', 3), notes: 'Demo lead. Owner answers his own phone.' },
   { business_name: 'Copperfield Plumbing', owner_name: 'Marisol Reyes', phone: '(303) 555-0118', email: '', website: 'copperfieldplumbing.example', city: 'Denver', state: 'CO', trade: 'Plumber', source: 'facebook_group', source_link: 'https://facebook.example/groups/plumbers/posts/1', batch: 'Demo plumbers' },
-  { business_name: 'Sunbelt Air & Heating', owner_name: 'Troy Marsh', phone: '(602) 555-0177', email: 'troy@sunbeltair.example', website: 'sunbeltair.example', city: 'Phoenix', state: 'AZ', trade: 'HVAC', source: 'google_maps', batch: 'Demo HVAC', competitor_checked: 'Desert Cool HVAC', competitor_checked_date: Lib.dayKey(new Date(), 'Africa/Johannesburg') },
+  { business_name: 'Sunbelt Air & Heating', owner_name: 'Troy Marsh', phone: '(602) 555-0177', email: 'troy@sunbeltair.example', website: 'sunbeltair.example', city: 'Phoenix', state: 'AZ', trade: 'HVAC', source: 'google_maps', batch: 'Demo HVAC', competitor_checked: 'Desert Cool HVAC', competitor_checked_date: Lib.myDayKey(new Date(), 'Africa/Johannesburg', 3) },
   { business_name: 'Bayview HVAC', owner_name: 'Priya Nair', phone: '(619) 555-0104', email: 'priya@bayviewhvac.example', website: 'bayviewhvac.example', city: 'San Diego', state: 'CA', trade: 'HVAC', source: 'instagram', source_link: 'https://instagram.example/bayviewhvac', batch: 'Demo HVAC' },
   { business_name: 'Harbor Light Electric', owner_name: 'Cal Donovan', phone: '(843) 555-0165', website: 'harborlightelectric.example', city: 'Charleston', state: 'SC', trade: 'Electrician', source: 'referral', batch: 'Demo referrals' },
   { business_name: 'Northwind Landscaping', owner_name: 'Ingrid Olsen', phone: '(907) 555-0131', website: 'northwindlandscaping.example', city: 'Anchorage', state: 'AK', trade: 'Landscaper', source: 'google_maps', batch: 'Demo landscapers' },
@@ -46,12 +46,12 @@ async function seed(opts) {
   // Sunbelt: calls, spoke to owner, proposal
   await log('Sunbelt Air & Heating', 'call', 'no_answer', day(-7, 16, 0));
   await log('Sunbelt Air & Heating', 'call', 'spoke_to_owner', day(-3, 17, 15), 'Talked about being #4 on Maps, he wants a proposal.');
-  await S.putDeal(ids['Sunbelt Air & Heating'], { proposal_sent_date: Lib.dayKey(new Date(Date.now() - 86400000), 'Africa/Johannesburg'), deal_value: 1000 });
+  await S.putDeal(ids['Sunbelt Air & Heating'], { proposal_sent_date: Lib.myDayKey(new Date(Date.now() - 86400000), 'Africa/Johannesburg', 3), deal_value: 1000 });
   // Bayview: closed
   await log('Bayview HVAC', 'instagram_dm', 'sent', day(-12, 14, 0));
   await log('Bayview HVAC', 'instagram_dm', 'replied', day(-11, 10, 0), 'Yes please.');
   await log('Bayview HVAC', 'call', 'booked', day(-9, 18, 0), 'Booked a Tuesday call.');
-  await S.putDeal(ids['Bayview HVAC'], { call_at: day(-8, 19, 0), call_result: 'show', proposal_sent_date: Lib.dayKey(new Date(Date.now() - 7 * 86400000), 'Africa/Johannesburg'), deposit_paid_date: Lib.dayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg'), deposit_amount: 500, signed_date: Lib.dayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg'), deal_value: 1000 });
+  await S.putDeal(ids['Bayview HVAC'], { call_at: day(-8, 19, 0), call_result: 'show', proposal_sent_date: Lib.myDayKey(new Date(Date.now() - 7 * 86400000), 'Africa/Johannesburg', 3), deposit_paid_date: Lib.myDayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg', 3), deposit_amount: 500, signed_date: Lib.myDayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg', 3), deal_value: 1000 });
   // Harbor Light, Northwind and Lakeshore stay untouched (status New) so the call queue has people in it
   // Granite Peak: booked call in the future
   await log('Granite Peak HVAC', 'facebook_dm', 'replied', day(-2, 11, 0), 'Works for me, call tomorrow.');
@@ -63,9 +63,9 @@ async function seed(opts) {
   await S.optOut(ids['Prairie State Roofing'], { channel: 'all', note: 'Replied to the email asking to be removed.', at: day(-5, 9, 5) });
   // Palm Coast: a couple of stale attempts so follow-ups are overdue
   await log('Palm Coast Pressure Washing', 'instagram_dm', 'sent', day(-9, 8, 0), 'Opener sent.');
-  await db.run('UPDATE leads SET next_followup = ? WHERE id = ?', Lib.addDaysKey(Lib.dayKey(new Date(), 'Africa/Johannesburg'), -3), ids['Palm Coast Pressure Washing']);
+  await db.run('UPDATE leads SET next_followup = ? WHERE id = ?', Lib.addDaysKey(Lib.myDayKey(new Date(), 'Africa/Johannesburg', 3), -3), ids['Palm Coast Pressure Washing']);
 
-  const todayKey = Lib.dayKey(new Date(), 'Africa/Johannesburg');
+  const todayKey = Lib.myDayKey(new Date(), 'Africa/Johannesburg', 3);
   await db.run('UPDATE leads SET next_followup = ? WHERE id IN (?, ?)', todayKey, ids['Copperfield Plumbing'], ids['Sunbelt Air & Heating']);
   return { added: LEADS.length, existing: 0 };
 }

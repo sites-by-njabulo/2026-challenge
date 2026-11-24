@@ -166,6 +166,14 @@
     const p = parts(date instanceof Date ? date : new Date(date), tz);
     return pad(p.year, 4) + '-' + pad(p.month) + '-' + pad(p.day);
   }
+  /* MY day (not a lead's): the calendar day in tz, but the day only rolls over at startHour (0 to 6) instead of midnight, so 00:00 to
+     startHour:59 still belongs to the day before. Used for everything that counts "my" day (today, counters, scoreboard, stats, follow-ups due).
+     It must never be used for a lead's own clock (calling window, local time): those use parts() and okToCall() and stay exact. */
+  function myDayKey(date, tz, startHour) {
+    const h = Math.min(6, Math.max(0, Math.floor(Number(startHour)) || 0));
+    const d = date instanceof Date ? date : new Date(date);
+    return dayKey(new Date(d.getTime() - h * 3600000), tz);
+  }
   function tzOffsetMs(utcMs, tz) {
     const p = parts(new Date(utcMs), tz);
     return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(utcMs / 1000) * 1000;
@@ -289,7 +297,7 @@
     CHANNELS, CHANNEL_LABEL, OUTCOMES, OUTCOME_LABEL, RESPONSE_OUTCOMES, CONVERSATION_OUTCOMES, REACHED_OUTCOMES, GOOD_OUTCOMES, STATUSES, BOARD, STATUS_LABEL, STATUS_RANK, CHANNEL_GROUPS,
     SOURCES, SOURCE_LABEL, FOLLOWUP_DAYS, STATE_TZ, TZ_CHOICES,
     normPhone, formatPhone, normWebsite, normEmail, normName, nameCityKey, alnum, normState, tzForLead,
-    parts, dayKey, zonedToUtc, utcToZonedInput, tzAbbr, fmtClock, addDaysKey, addBizDays, mondayOf, daysBetween,
+    parts, dayKey, myDayKey, zonedToUtc, utcToZonedInput, tzAbbr, fmtClock, addDaysKey, addBizDays, mondayOf, daysBetween,
     weekdayOfKey, okToCall, fmtDur, parseCSV, toCSV, detectDelimiter, pad,
   };
 });

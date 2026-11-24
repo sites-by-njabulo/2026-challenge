@@ -188,6 +188,79 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     check('Calls queue: HIGH odds first, then MEDIUM, then LOW, then leads with no odds', qOrder.length >= 3 && qOrder[0].odds === 'Owner odds: High' && qOrder[0].id === readyIds[2] && qOrder[1].odds === 'Owner odds: Medium' && qOrder[1].id === readyIds[1] && qOrder[2].odds === 'Owner odds: Low' && qOrder[2].id === readyIds[0] && qOrder.slice(3).every((x) => x.odds === null), qOrder.slice(0, 5));
     await shot('02c2-calls-queue-odds');
 
+    /* the Open quick look on the Calls page: three buttons per row, a light panel, you never leave the page */
+    const RIUI = { query: 'plumber in Norristown PA', my_rank: 5, total: 79, top3: [{ rank: 1, name: 'Valdel Plumbing', rating: 4.8, reviews: 1094, phone: '+1 484-246-6888' }, { rank: 2, name: 'Ray Ross Plumbing & Heating', rating: 4.7, reviews: 68, phone: '+1 267-228-7287' }, { rank: 3, name: 'Plumb it Heat it Cool it', rating: 4.9, reviews: 858, phone: null }], source: 'google-maps-scrape', checked_at: '2026-11-25' };
+    await page.evaluate(async (id, ri) => { await fetch('/api/leads/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rank_info: ri, website: 'https://open-panel-test.example', owner_name: 'Olive Owner' }) }); }, readyIds[2], RIUI);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.meter');
+    await sleep(700);
+    const btnInfo = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('section .ledger .row')];
+      const labels = (r) => [...r.querySelectorAll('.act > *')].map((b) => b.textContent.trim());
+      const first = rows[0], open = first.querySelector('.act button[data-open-lead]'), call = first.querySelector('.act a.btn'), log = [...first.querySelectorAll('.act button')].find((b) => b.textContent.trim() === 'Log call');
+      return { all: rows.every((r) => labels(r).join('|') === 'Call|Log call|Open'), n: rows.length, ow: open.getBoundingClientRect().width, lw: log.getBoundingClientRect().width, cw: call.getBoundingClientRect().width, label: open.getAttribute('aria-label'), ghost: open.classList.contains('ghost'), callMain: call.classList.contains('lampbtn') };
+    });
+    check('Calls: every ready row has Call, Log call and Open (in that order)', btnInfo.all && btnInfo.n >= 3, btnInfo);
+    check('Calls: Open is compact and quieter than Call (outline, narrower than Log call, labelled for screen readers)', btnInfo.ghost && btnInfo.callMain && btnInfo.ow < btnInfo.lw && /^Open details for /.test(btnInfo.label), btnInfo);
+    await page.focus('section .ledger .row .act button[data-open-lead]');
+    await page.keyboard.press('Enter');
+    await wait('dialog.peek[open]');
+    await sleep(200);
+    await shot('02c3-calls-open-panel');
+    const peek = await page.evaluate(() => {
+      const d = document.querySelector('dialog.peek[open]');
+      const t = d.textContent.replace(/\s+/g, ' ');
+      return { hash: location.hash, text: t, comps: d.querySelectorAll('.peek-comps li').length, forms: d.querySelectorAll('textarea, select, input, .outcomes, .inline-log').length,
+        site: (d.querySelector('a.peek-site') || {}).href, siteRel: (d.querySelector('a.peek-site') || {}).rel, tel: [...d.querySelectorAll('a[href^="tel:"]')].length,
+        h2: d.querySelector('h2').textContent, active: document.activeElement.closest('dialog') === d };
+    });
+    check('Open: it stays on the Calls page and opens a dialog with the business name', peek.hash === '#/calls' && peek.h2.length > 2 && peek.active, peek);
+    check('Open: shows owner, odds label, phone, location and the website link (new tab, noopener)', /Owner\s*Olive Owner/.test(peek.text) && /High odds/.test(peek.text) && /Phone/.test(peek.text) && /Location/.test(peek.text) && /open-panel-test\.example/.test(peek.text) && /^https:\/\/open-panel-test\.example/.test(peek.site) && /noopener/.test(peek.siteRel), peek);
+    check('Open: shows the real ranking line, three competitors with rating, reviews and phone', /Ranks #5 of 79 on Google Maps for ‘plumber in Norristown PA’/.test(peek.text) && peek.comps === 3 && /Valdel Plumbing/.test(peek.text) && /4\.8 stars, 1,094 reviews/.test(peek.text) && /\(484\) 246-6888/.test(peek.text), peek.text);
+    check('Open: the honest hint says the list is a snapshot and rankings move', /Seen on the day the list was scraped \(Wed 25 Nov\)\. Rankings move and shift by where the searcher is, so re-check before you say it on a call\./.test(peek.text), peek.text);
+    check('Open: light only, no script, no log form, no notes, no status controls, no history', peek.forms === 0 && !/\bscript\b|Log a contact|\bNotes\b|\bStatus\b|\bHistory\b|Timeline/i.test(peek.text), peek.text);
+    check('Open: no em dash, no en dash and never the word cost in the panel', !/[–—]/.test(peek.text) && !/\bcost/i.test(peek.text), peek.text);
+    check('Open: a small Call button inside the panel dials the number', peek.tel >= 2 && /Call/.test(peek.text), peek.tel);
+    await page.keyboard.press('Escape');
+    await sleep(250);
+    const afterEsc = await page.evaluate(() => ({ open: !!document.querySelector('dialog[open]'), onOpenBtn: document.activeElement.matches('button[data-open-lead]'), same: document.activeElement.closest('.row') === document.querySelector('section .ledger .row') }));
+    check('Open: Esc closes it and focus returns to that row\'s Open button', !afterEsc.open && afterEsc.onOpenBtn && afterEsc.same, afterEsc);
+    await page.evaluate(() => document.querySelectorAll('section .ledger .row')[1].querySelector('button[data-open-lead]').click());
+    await wait('dialog.peek[open]');
+    const noRank = await page.evaluate(() => document.querySelector('dialog.peek[open]').textContent.replace(/\s+/g, ' '));
+    check('Open: a lead with no ranking data says so plainly and still shows the basics', /No ranking data for this one yet\./.test(noRank) && !/Ranks #/.test(noRank) && /Phone/.test(noRank) && /Website/.test(noRank), noRank);
+    await page.click('dialog.peek[open] .dlg-foot button');
+    await sleep(250);
+    check('Open: the Close button closes it in one tap and focus goes back', await page.evaluate(() => !document.querySelector('dialog[open]') && document.activeElement.matches('button[data-open-lead]') && document.activeElement.closest('.row') === document.querySelectorAll('section .ledger .row')[1]), 1);
+    // a phone, 375 wide, touch
+    await page.setViewport({ width: 375, height: 740, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.meter');
+    await sleep(600);
+    await page.evaluate(() => document.querySelector('section .ledger .row button[data-open-lead]').scrollIntoView({ block: 'center' }));
+    await page.tap('section .ledger .row button[data-open-lead]');
+    await wait('dialog.peek[open]');
+    await sleep(250);
+    await shot('02c4-calls-open-panel-phone');
+    const ph = await page.evaluate(() => {
+      const d = document.querySelector('dialog.peek[open]'), vw = document.documentElement.clientWidth;
+      const r = d.getBoundingClientRect();
+      const ctl = [...d.querySelectorAll('button, a[href]')].filter((e) => e.offsetParent !== null);
+      const small = ctl.filter((e) => { const b = e.getBoundingClientRect(); return b.height < 43.5; }).map((e) => e.textContent.trim().slice(0, 30) + ' ' + Math.round(e.getBoundingClientRect().height));
+      const inner = d.querySelector('.dlg');
+      return { vw, left: r.left, right: r.right, over: d.scrollWidth - d.clientWidth, innerOver: inner.scrollWidth - inner.clientWidth, small, n: ctl.length, bodyOver: document.documentElement.scrollWidth - vw };
+    });
+    check('Open on a 375 px phone: fits the screen, no sideways scroll, every button and link is at least 44 px tall', ph.vw === 375 && ph.left >= 0 && ph.right <= 375.5 && ph.over <= 1 && ph.innerOver <= 1 && ph.bodyOver <= 1 && ph.small.length === 0 && ph.n >= 5, ph);
+    await page.tap('dialog.peek[open] .dlg-head .iconbtn');
+    await sleep(250);
+    check('Open on a phone: the X closes it with one tap', await page.evaluate(() => !document.querySelector('dialog[open]')), 1);
+    const reduced = await page.evaluate(() => { const css = [...document.styleSheets].flatMap((s) => { try { return [...s.cssRules]; } catch (e) { return []; } }); return !css.some((r) => r.cssText && /dialog\.peek/.test(r.cssText) && /(animation|transition)/.test(r.cssText)); });
+    check('Open: the panel adds no animation of its own (reduced motion is respected)', reduced, 1);
+    await page.setViewport({ width: 1366, height: 900 });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.meter');
+    await sleep(500);
+
     /* log a call from the queue in two taps */
     const beforeCalls = await page.evaluate(() => document.querySelector('.meter .big').textContent);
     await clickText('Log call');
@@ -418,6 +491,22 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await wait('#s-script');
     const setText = await page.evaluate(() => document.body.textContent);
     check('Settings: Export and Backups say the data lives in Supabase, Supabase keeps its own backups, and a copy can be downloaded', /Your data lives in your Supabase database/.test(setText) && /Supabase keeps its own backups/.test(setText) && !/data\/backups|this computer|Back up now/.test(setText) && (await page.$$('a[href="/api/export/all.zip"]')).length >= 2, setText.slice(0, 80));
+
+    const dayUi = await page.evaluate(async () => {
+      const label = document.querySelector('label[for="s-daystart"]'), input = document.querySelector('#s-daystart');
+      const ui = await import('/ui.js');
+      return { label: label && label.textContent, hint: input && input.closest('.field').querySelector('.hint').textContent, value: input && input.value, type: input && input.type, min: input && input.min, max: input && input.max, fs: input && parseFloat(getComputedStyle(input).fontSize), h: input && input.getBoundingClientRect().height,
+        before: ui.myDay(new Date('2026-11-25T23:30:00Z')), after: ui.myDay(new Date('2026-11-26T01:30:00Z')), start: ui.myDayStart() };
+    });
+    check('Settings: "My day starts at (hour, 0 to 6)" with its hint, default 3, 44 px high and 16 px text', /^My day starts at \(hour, 0 to 6\)$/.test(dayUi.label) && /Work after midnight\? Your counters keep counting the same day until this hour\./.test(dayUi.hint) && dayUi.value === '3' && dayUi.type === 'number' && dayUi.min === '0' && dayUi.max === '6' && dayUi.fs >= 16 && dayUi.h >= 43.5, dayUi);
+    check('the screens use my day: 23:30 UTC on the 25th (01:30 SAST on the 26th) is still the 25th, 03:30 SAST is the 26th', dayUi.before === '2026-11-25' && dayUi.after === '2026-11-26' && dayUi.start === 3, dayUi);
+    await page.evaluate(() => { const i = document.querySelector('#s-daystart'); i.value = '1'; });
+    await clickText('Save', 'button');
+    await sleep(500);
+    check('Settings: saving a new day start works and is stored', (await db.get("SELECT value FROM settings WHERE key = 'day_start_hour'")).value === '1', 1);
+    await page.evaluate(async () => { await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ day_start_hour: 3 }) }); });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('#s-script');
 
     /* ---------- Email page (Zapmail snapshot) ---------- */
     await page.goto(BASE + '/#/email');

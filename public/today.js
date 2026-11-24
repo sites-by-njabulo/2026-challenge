@@ -1,4 +1,4 @@
-import { h, Lib, icon, api, toast, loc, fmtDateTime, fmtDay, money, myTz, telLink, debounce, autoRefresh } from './ui.js';
+import { h, Lib, icon, api, toast, loc, fmtDateTime, fmtDay, money, myTz, myDay, telLink, debounce, autoRefresh } from './ui.js';
 
 /* the lead form and the follow-ups screen are only fetched when you tap for them, so Today opens faster */
 const openLeadForm = async (opts) => { (await import('./leads.js')).openLeadForm(opts); };
@@ -19,7 +19,7 @@ export async function renderToday(view) {
 
   const tickClock = () => {
     const now = new Date();
-    clock.textContent = fmtDay(Lib.dayKey(now, myTz())) + ' · ' + Lib.fmtClock(now, myTz()) + ' ' + Lib.tzAbbr(now, myTz());
+    clock.textContent = fmtDay(myDay(now)) + ' · ' + Lib.fmtClock(now, myTz()) + ' ' + Lib.tzAbbr(now, myTz());
   };
   tickClock();
   const clockTimer = setInterval(tickClock, 15000);

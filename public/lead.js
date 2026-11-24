@@ -1,4 +1,4 @@
-import { h, Lib, icon, api, toast, dialog, head, confirmDialog, loc, statusChip, oddsChip, ODDS_CHOICES, relDay, fmtDateTime, fmtDay, money, myTz, telLink, windowMarker, timesLine, tzLabel, state, CHANNEL_ICON, channelChips } from './ui.js';
+import { h, Lib, icon, api, toast, dialog, head, confirmDialog, loc, statusChip, oddsChip, ODDS_CHOICES, relDay, fmtDateTime, fmtDay, money, myTz, myDay, telLink, windowMarker, timesLine, tzLabel, state, CHANNEL_ICON, channelChips } from './ui.js';
 import { logPanel } from './log.js';
 import { openLeadForm } from './leads.js';
 
@@ -27,7 +27,7 @@ export async function renderLead(view, id) {
 
   function draw() {
     const l = data.lead, now = new Date(), s = state.settings;
-    const today = Lib.dayKey(now, myTz());
+    const today = myDay(now);
     const w = l.tz ? Lib.okToCall(now, l.tz, s.call_window_start, s.call_window_end) : null;
 
     /* header */
