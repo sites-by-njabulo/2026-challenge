@@ -356,12 +356,15 @@ async function todayData(now, followLimit) {
   const overdue = (await db.get(`SELECT COUNT(*) AS n FROM leads l WHERE ${dueWhere} AND l.next_followup < ?`, today, today)).n;
   const rows = (await db.all(LEAD_LIST_SQL + ` WHERE ${dueWhere} ORDER BY l.next_followup ASC, l.id ASC LIMIT ?`, today, Math.min(Number(followLimit) || 8, 200)))
     .map((r) => ({ ...leadLite(r, now, s), overdue: r.next_followup < today, email: r.email }));
+  const dueRows = await db.all(LEAD_LIST_SQL + ` WHERE ${dueWhere}`, today);
+  const followups_by = {};
+  for (const g of Object.keys(Lib.CHANNEL_GROUPS)) followups_by[g] = dueRows.filter((r) => Lib.CHANNEL_GROUPS[g].includes(r.last_channel)).length;
   const booked = (await db.all(`SELECT d.*, l.business_name, l.owner_name, l.phone, l.city, l.state, l.timezone, l.id AS lid FROM deals d JOIN leads l ON l.id = d.lead_id
     WHERE l.opted_out = 0 AND d.call_at IS NOT NULL AND d.call_at >= ? AND d.call_at <= ? AND (d.call_result IS NULL OR d.call_result = 'pending')
     ORDER BY d.call_at ASC`, new Date(now.getTime() - 3 * 3600000).toISOString(), new Date(now.getTime() + 72 * 3600000).toISOString()))
     .map((d) => ({ lead_id: d.lid, business_name: d.business_name, owner_name: d.owner_name, phone: d.phone, city: d.city, state: d.state,
       tz: Lib.tzForLead(d), call_at: d.call_at, hours_away: Math.round(((new Date(d.call_at) - now) / 3600000) * 10) / 10 }));
-  return { now: now.toISOString(), progress, outreach, followups_total: total, followups_overdue: overdue, followups: rows, booked, goal: await goalData(now), window: { start: s.call_window_start, end: s.call_window_end }, my_timezone: s.my_timezone };
+  return { now: now.toISOString(), progress, outreach, followups_total: total, followups_overdue: overdue, followups_by, followups: rows, booked, goal: await goalData(now), window: { start: s.call_window_start, end: s.call_window_end }, my_timezone: s.my_timezone };
 }
 
 /* Follow-ups page: everything due (or coming up), filterable by the channel of the last contact. */

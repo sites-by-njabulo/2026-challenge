@@ -29,7 +29,7 @@ export function logPanel(lead, opts) {
     return root;
   }
 
-  const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Channel' });
+  const seg = h('div', { class: 'seg channels' + (compact ? ' c' : ''), role: 'group', 'aria-label': 'Channel' });
   const outcomes = h('div', { class: 'outcomes', role: 'group', 'aria-label': 'Outcome' });
   const content = h('textarea', { class: 'input', id: 'lg-content-' + lead.id, rows: 3, placeholder: '' });
   const note = h('input', { class: 'input', id: 'lg-note-' + lead.id, placeholder: 'Anything to remember' });

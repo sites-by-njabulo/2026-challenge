@@ -30,7 +30,7 @@ function connectPanel(zs, reload) {
       h('div', { class: 'actions', style: 'padding-top:12px' }, refresh, off), err,
       h('p', { class: 'hint', style: 'margin-top:14px;max-width:640px' }, 'This app only ever asks Zapmail for three read-only lists: mailboxes, domains and warm-up scores. It cannot buy, change or delete anything in Zapmail.'));
   }
-  const key = h('input', { class: 'input', id: 'zm-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: 'Paste your Zapmail API key', style: 'max-width:460px' });
+  const key = h('input', { class: 'input', id: 'zm-key', type: 'password', autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'go', placeholder: 'Paste your Zapmail API key', style: 'max-width:460px' });
   const go = h('button', { class: 'btn', type: 'button' }, 'Connect');
   go.addEventListener('click', async () => {
     err.textContent = ''; go.setAttribute('disabled', '');
@@ -118,8 +118,8 @@ export async function renderEmail(view) {
   out.push(h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'How many to send')),
     h('div', { style: 'display:flex;gap:12px;align-items:end;flex-wrap:wrap;padding:16px 0' }, h('div', { class: 'field' }, h('label', { for: 'em-limit' }, 'Cold emails per mailbox per day (your cap)'), limitInput), saveLimit,
       h('div', { class: 'hint' }, 'That is ' + d.capacity_today + ' a day across ' + mailboxes.length + ' mailboxes. Sent today: ' + d.cold.sent_today + '.')),
-    h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, h('th', null, 'When'), h('th', null, 'Step'), h('th', { class: 'r' }, 'Per mailbox'), h('th', { class: 'r' }, 'Across all ' + mailboxes.length))),
-      h('tbody', null, ...planRows.map(([when, step, lo, hi]) => h('tr', null, h('td', null, when), h('td', null, step), h('td', { class: 'r' }, hi ? lo + ' to ' + hi : '0'), h('td', { class: 'r' }, hi ? lo * n + ' to ' + hi * n : '0')))))),
+    h('div', { class: 'table-wrap' }, h('table', { class: 't cards' }, h('thead', null, h('tr', null, h('th', null, 'When'), h('th', null, 'Step'), h('th', { class: 'r' }, 'Per mailbox'), h('th', { class: 'r' }, 'Across all ' + mailboxes.length))),
+      h('tbody', null, ...planRows.map(([when, step, lo, hi]) => h('tr', null, h('td', null, when), h('td', { 'data-label': 'Step' }, step), h('td', { class: 'r', 'data-label': 'Per mailbox' }, hi ? lo + ' to ' + hi : '0'), h('td', { class: 'r', 'data-label': 'Across all ' + mailboxes.length }, hi ? lo * n + ' to ' + hi * n : '0')))))),
     h('p', { class: 'hint', style: 'margin-top:8px' }, 'Step up only while bounces stay under about 2% and spam complaints stay at zero. If a step looks bad, hold or go back a step. The ceiling is about 20 to 25 per mailbox a day.')));
 
   /* cold email results */

@@ -76,7 +76,8 @@ Too many wrong tries locks that screen for 10 minutes.
 ## Step 6. Use it on your phone
 
 1. Open the same web address on your phone and sign in.
-2. Add it to your home screen. On iPhone: Share, then **Add to Home Screen**. On Android: the menu, then **Add to Home screen**.
+2. Add it to your home screen. On iPhone: Share, then **Add to Home Screen**. On Android: the menu, then **Add to Home screen** (or **Install app**). It opens full screen as "Lead Tracker" with a dark square and a green dot as its icon.
+3. If you ever change the look of the icon, edit `scripts/make-icons.js`, run `node scripts/make-icons.js`, and redeploy. Phones keep the old icon on a home screen that is already installed, so remove it and add it again to see the new one.
 
 ## Step 7. Bring your 71 leads over
 
@@ -157,6 +158,7 @@ Your tracker on this computer was never changed. To go back, just keep using it 
 
 ## Good to know
 
+- The fonts, icons and manifest are served from this site itself (nothing is loaded from Google). `vercel.json` caches the fonts for a year and the icons for a week. The scripts and styles are checked for a newer version every time the app opens, so a new deploy shows up on the next open without clearing anything.
 - Opening the tracker after a quiet spell can take a second or two longer. That is normal for Vercel.
 - The tracker is private. Every page and every number needs your password. It also tells search engines not to list it.
 - Your cookie lasts 30 days. After that you sign in again.

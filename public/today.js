@@ -1,8 +1,10 @@
-import { h, Lib, icon, api, toast, loc, fmtDateTime, fmtDay, money, myTz, telLink, debounce } from './ui.js';
-import { openLeadForm } from './leads.js';
-import { followupRow } from './rows.js';
+import { h, Lib, icon, api, toast, loc, fmtDateTime, fmtDay, money, myTz, telLink, debounce, autoRefresh } from './ui.js';
 
-const PREVIEW = 6;
+/* the lead form and the follow-ups screen are only fetched when you tap for them, so Today opens faster */
+const openLeadForm = async (opts) => { (await import('./leads.js')).openLeadForm(opts); };
+const openFollowups = async (channel) => { (await import('./followups.js')).openFollowups(channel); };
+
+const PREVIEW = 1;
 const OUT_ICON = { call: 'phone', instagram_dm: 'chat', facebook_dm: 'chat', email: 'mail' };
 
 export async function renderToday(view) {
@@ -92,6 +94,17 @@ export async function renderToday(view) {
       h('div', { class: 'act' }, h('span', { class: 'chip ' + (hrs <= 3 ? 'dup' : 'flat') }, hrs > 0 ? 'in ' + (hrs < 1 ? Math.round(hrs * 60) + 'm' : Math.round(hrs) + 'h') : 'now'), h('a', { class: 'btn ghost sm', href: '#/lead/' + b.lead_id }, 'Open')));
   }
 
+  /* One count and one button, because a follow-up day can be 30 people, not 3. */
+  function followupSummary(d, total) {
+    const labels = { dm: 'DMs', email: 'Email', call: 'Calls', text: 'Texts' };
+    const by = d.followups_by || {};
+    const chips = Object.keys(labels).filter((k) => by[k] > 0).map((k) => h('button', { class: 'btn ghost sm', type: 'button', onclick: () => openFollowups(k) }, labels[k] + ' ', h('span', { class: 'mono' }, by[k])));
+    return h('div', { style: 'padding-top:18px' },
+      h('div', { style: 'font-size:22px;font-weight:600;letter-spacing:-0.01em' }, total + (total === 1 ? ' person to follow up with' : ' people to follow up with')),
+      chips.length ? h('div', { class: 'actions', style: 'padding-top:12px;display:flex;gap:8px;flex-wrap:wrap' }, ...chips) : null,
+      h('div', { style: 'padding-top:16px' }, h('button', { class: 'btn', type: 'button', onclick: () => openFollowups('') }, 'Start follow-ups')));
+  }
+
   function draw() {
     const p = data.progress;
     const ctx = { open, today: p.today, onLogged: load };
@@ -104,12 +117,11 @@ export async function renderToday(view) {
     const total = data.followups_total;
     sections.push(h('section', { class: 'section' },
       h('div', { class: 'sec-head' }, h('h2', null, 'Follow up'), h('span', { class: 'count' }, total ? total + ' due' + (data.followups_overdue ? ' · ' + data.followups_overdue + ' overdue' : '') : '')),
-      total ? h('ul', { class: 'ledger' }, ...data.followups.map((l) => followupRow(l, ctx))) : h('div', { class: 'empty' }, 'No follow-ups due. Log a contact and its next follow-up date shows up here.'),
-      total > data.followups.length ? h('div', { style: 'padding-top:20px' }, h('a', { class: 'btn', href: '#/followups' }, 'See all ' + total + ' follow-ups')) : null));
+      total ? followupSummary(data, total) : h('div', { class: 'empty' }, 'No follow-ups due. Log a contact and its next follow-up date shows up here.')));
     body.replaceChildren(...sections);
   }
 
   await load();
-  const refresh = setInterval(() => { if (!document.hidden && !view.querySelector('.inline-log') && !document.querySelector('dialog[open]') && !(document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('stat-value'))) load(); }, 30000);
-  return () => { clearInterval(clockTimer); clearInterval(refresh); };
+  const stopRefresh = autoRefresh(load, 60000, () => view.querySelector('.inline-log') || document.querySelector('dialog[open]') || (document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('stat-value')));
+  return () => { clearInterval(clockTimer); stopRefresh(); };
 }

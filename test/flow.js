@@ -169,6 +169,10 @@ async function wholeDatabaseText() {
     check('status and follow-up can be set by hand', r.json.lead.status === 'follow_up', r.json.lead);
     const today = (await call('GET', '/api/today')).json;
     check('lead due today appears in Follow up today', today.followups.some((x) => x.id === maple), today.followups.map((x) => x.id));
+    const fuAll = (await call('GET', '/api/followups?scope=due')).json;
+    const by = today.followups_by || {};
+    check('/api/today returns followups_by with one count per channel group', ['call', 'dm', 'email', 'text'].every((g) => Number.isInteger(by[g]) && by[g] >= 0), by);
+    check('followups_by matches the Follow-ups page counts and never exceeds the total due', ['call', 'dm', 'email', 'text'].every((g) => by[g] === fuAll.counts[g]) && today.followups_total === fuAll.counts.all && Object.values(by).reduce((n, v) => n + v, 0) <= today.followups_total, [by, today.followups_total, fuAll.counts]);
     check('today progress counts the calls just logged', today.progress.calls >= 2 && today.progress.dms >= 1, today.progress);
 
     /* ---------- opt out ---------- */

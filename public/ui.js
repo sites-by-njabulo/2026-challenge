@@ -96,6 +96,10 @@ export function dialog(build, opts) {
   return new Promise((resolve) => {
     dlg.addEventListener('close', () => { dlg.remove(); resolve(dlg.returnValue || null); });
     dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(''); });
+    dlg.addEventListener('focusin', (e) => {
+      const t = e.target;
+      if (t && t.matches && t.matches('input, textarea, select')) setTimeout(() => { try { t.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (err) { /* ignore */ } }, 320);
+    });
     dlg.showModal();
     const first = dlg.querySelector('[autofocus], input:not([type=hidden]), textarea, select');
     if (first && !opts.noFocus) first.focus();
@@ -109,8 +113,8 @@ export function confirmDialog({ title, message, confirmLabel, danger, typed, typ
     const input = typed ? h('input', { class: 'input', 'aria-label': typedLabel || 'Type to confirm', autocomplete: 'off', autofocus: true }) : null;
     const ok = h('button', { class: 'btn' + (danger ? ' danger' : ''), type: 'button', disabled: !!typed, onclick: () => close('yes') }, confirmLabel || 'Confirm');
     if (input) input.addEventListener('input', () => { if (input.value === typed) ok.removeAttribute('disabled'); else ok.setAttribute('disabled', ''); });
-    root.append(head(title, close), h('p', null, message), input && h('div', { class: 'field' }, h('label', null, typedLabel || 'Type ' + typed + ' to confirm'), input),
-      h('div', { class: 'dlg-foot' }, h('button', { class: 'btn ghost', type: 'button', onclick: () => close('') }, 'Cancel'), ok));
+    append(root, [head(title, close), h('p', null, message), input && h('div', { class: 'field' }, h('label', null, typedLabel || 'Type ' + typed + ' to confirm'), input),
+      h('div', { class: 'dlg-foot' }, h('button', { class: 'btn ghost', type: 'button', onclick: () => close('') }, 'Cancel'), ok)]);
   }).then((v) => v === 'yes');
 }
 
@@ -120,7 +124,10 @@ export function setUnauthorizedHandler(fn) { onUnauthorized = fn; }
 export async function api(method, path, body) {
   // reads that depend on "now" use this browser's clock, so what you see always matches your own screen
   if ((/^\/api\/(today|calls|followups|pipeline|stats|outreach|email)(\/|\?|$)/.test(path) || /^\/api\/leads\/\d+\/contacts/.test(path)) && !/[?&]now=/.test(path)) path += (path.includes('?') ? '&' : '?') + 'now=' + encodeURIComponent(new Date().toISOString());
-  const res = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  let res;
+  try { res = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' }); } catch (e) {
+    const err = new Error('No connection. Check your signal and try again.'); err.offline = true; throw err;
+  }
   let data = null;
   try { data = await res.json(); } catch (e) { /* not json */ }
   if (res.status === 401 && !path.startsWith('/api/login') && !path.startsWith('/api/password')) onUnauthorized();
@@ -207,3 +214,41 @@ export function getMailboxes() {
   return mailboxCache;
 }
 export function forgetMailboxes() { mailboxCache = null; }
+
+/* A <details> that is open on a wide screen and starts closed on a phone (unless force is true). Its summary is hidden on wide screens by CSS. */
+export function responsiveFold(details, force) {
+  const mq = window.matchMedia('(max-width: 860px)');
+  const apply = () => { if (!mq.matches) details.open = true; };
+  details.open = !mq.matches || !!force;
+  details.classList.add('rfold');
+  if (mq.addEventListener) mq.addEventListener('change', apply);
+  return details;
+}
+
+/* Runs fn every ms while the page is visible, and once when you come back to the app after being away longer than ms. */
+export function autoRefresh(fn, ms, skip) {
+  let last = Date.now();
+  const run = () => { last = Date.now(); fn(); };
+  const timer = setInterval(() => { if (!document.hidden && !(skip && skip())) run(); }, ms);
+  const onVis = () => { if (!document.hidden && Date.now() - last > ms && !(skip && skip())) run(); };
+  document.addEventListener('visibilitychange', onVis);
+  return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVis); };
+}
+
+/* Phone keyboard and toolbar handling. Sets --kb (how much of the bottom is covered) and a "typing" class so the bottom tabs
+   get out of the way while a field is focused. Same visualViewport idea as the iOS fixed-bar fix. */
+export function initViewport() {
+  const root = document.documentElement;
+  const vv = window.visualViewport;
+  const measure = () => {
+    if (!vv) return;
+    const covered = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+    root.style.setProperty('--kb', covered + 'px');
+    root.style.setProperty('--vvh', Math.round(vv.height) + 'px');
+  };
+  if (vv) { vv.addEventListener('resize', measure); vv.addEventListener('scroll', measure); window.addEventListener('pageshow', measure); measure(); }
+  const editable = (e) => e && e.matches && e.matches('input:not([type=checkbox]):not([type=radio]):not([type=file]):not([type=button]):not([type=submit]), textarea, select');
+  let off = null;
+  document.addEventListener('focusin', (e) => { clearTimeout(off); if (editable(e.target)) root.classList.add('typing'); });
+  document.addEventListener('focusout', () => { clearTimeout(off); off = setTimeout(() => { if (!editable(document.activeElement)) root.classList.remove('typing'); }, 120); });
+}

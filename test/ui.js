@@ -41,11 +41,13 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
   await new Promise((resolve) => srv.listen(PORT, '127.0.0.1', resolve));
   const browser = await puppeteer.launch({ executablePath: EDGE, headless: 'new', args: ['--no-sandbox'] });
   const errors = [];
+  const external = [];
   try {
     const page = await browser.newPage();
     page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
     page.on('console', (m) => { if (m.type() === 'error' && !/fonts\.(googleapis|gstatic)|ERR_(INTERNET|NAME|CONNECTION)|Failed to load resource/.test(m.text())) errors.push('console: ' + m.text()); });
     page.on('response', (r) => { if (r.status() >= 500) errors.push('HTTP ' + r.status() + ' ' + r.url()); });
+    page.on('request', (r) => { if (!/^(http:\/\/127\.0\.0\.1|data:|blob:)/.test(r.url())) external.push(r.url()); });
     await page.evaluateOnNewDocument((target) => {
       const RealDate = Date; const off = new RealDate(target).getTime() - RealDate.now();
       class FakeDate extends RealDate { constructor(...a) { if (a.length === 0) super(RealDate.now() + off); else super(...a); } static now() { return RealDate.now() + off; } }
@@ -68,6 +70,7 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     check('first run shows the set-password screen', (await page.$eval('h1', (h) => h.textContent)).includes('Set a password'), 1);
     check('first run also asks for the setup code, and the code box hides what you type', await page.evaluate(() => { const c = document.querySelector('#setup-code'); return !!c && c.type === 'password' && /Setup code/.test(document.body.textContent); }), 1);
     await shot('01-setup');
+    check('password managers can fill the form: new-password field with a name, a hidden user name, and the setup code is not autofilled', await page.evaluate(() => { const pw = document.querySelector('#pw'); const u = document.querySelector('input[autocomplete="username"]'); return pw.autocomplete === 'new-password' && pw.name === 'password' && !!u && u.getAttribute('aria-hidden') === 'true' && document.querySelector('#setup-code').autocomplete === 'off'; }), 1);
     await page.type('#pw', PW);
     await page.type('#setup-code', 'wrong-code-1234');
     await page.keyboard.press('Enter');
@@ -98,9 +101,11 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     const todayInfo = await page.evaluate(() => ({
       meters: [...document.querySelectorAll('.meter .label')].map((e) => e.textContent),
       sections: [...document.querySelectorAll('main section .sec-head h2')].map((e) => e.textContent),
-      rows: [...document.querySelectorAll('section')].find((x) => /Follow up/.test(x.textContent) && x.querySelector('.ledger') && !/Booked/.test(x.querySelector('h2').textContent)).querySelectorAll('.ledger .row').length,
+      rows: [...document.querySelectorAll('section')].filter((x) => x.querySelector('h2') && /^Follow up/.test(x.querySelector('h2').textContent)).map((x) => x.querySelectorAll('.ledger .row').length)[0],
+      summary: ([...document.querySelectorAll('section')].find((x) => x.querySelector('h2') && /^Follow up/.test(x.querySelector('h2').textContent)) || { textContent: '' }).textContent,
+      chips: [...document.querySelectorAll('section')].filter((x) => x.querySelector('h2') && /^Follow up/.test(x.querySelector('h2').textContent)).flatMap((x) => [...x.querySelectorAll('button.btn.ghost')].map((b) => b.textContent.trim())),
+      startBtn: [...document.querySelectorAll('button.btn')].map((x) => x.textContent.trim()).find((t) => /^Start follow-ups$/.test(t)),
       count: ([...document.querySelectorAll('.sec-head')].find((x) => /Follow up/.test(x.textContent)) || {}).textContent,
-      seeAll: [...document.querySelectorAll('a.btn')].map((x) => x.textContent.trim()).find((t) => /^See all/.test(t)),
       hasQueue: /OK to call now|Call queue/.test(document.querySelector('main').textContent),
     }));
     check('Today starts with how much has been made toward the goal', todayInfo.meters.length >= 1 && /Made so far/.test(todayInfo.meters[0]) && await page.evaluate(() => /^\$[\d,]+/.test(document.querySelector('.meter .big').textContent)), todayInfo.meters);
@@ -117,14 +122,25 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     check('the daily targets for calls and DMs are shown under the counters', /Calls \d+ of 50/.test(outAfter.targets) && /DMs \d+ of 30/.test(outAfter.targets), outAfter.targets);
     await shot('02a-today-counters');
     check('the Follow up heading shows the real count, not just the preview', /^Follow up\d+ due/.test(todayInfo.count) && Number(/(\d+) due/.exec(todayInfo.count)[1]) >= 15, todayInfo.count);
-    check('only a short preview of follow-ups is listed', todayInfo.rows <= 6 && todayInfo.rows >= 1, todayInfo.rows);
-    check('"See all N follow-ups" is offered', /^See all \d+ follow-ups$/.test(todayInfo.seeAll || ''), todayInfo.seeAll);
+    check('Today does not list individual follow-ups, only one count line', todayInfo.rows === 0 && /\d+ people to follow up with/.test(todayInfo.summary), [todayInfo.rows, todayInfo.summary]);
+    check('Today shows how many follow-ups are due per channel', todayInfo.chips.length >= 1 && todayInfo.chips.every((c) => /^(DMs|Email|Calls|Texts) \d+$/.test(c)), todayInfo.chips);
+    check('one "Start follow-ups" button is offered', todayInfo.startBtn === 'Start follow-ups', todayInfo.startBtn);
+    const dmChip = await page.evaluateHandle(() => [...document.querySelectorAll('button.btn.ghost')].find((b) => /^DMs \d+$/.test(b.textContent.trim())) || null);
+    if (dmChip.asElement()) {
+      await dmChip.asElement().click();
+      await wait('.seg');
+      await sleep(500);
+      const fuState = await page.evaluate(() => ({ hash: location.hash, pressed: [...document.querySelectorAll('.seg button[aria-pressed="true"]')].map((b) => b.textContent.trim()) }));
+      check('tapping a channel opens the Follow-ups page already filtered to it', fuState.hash === '#/followups' && fuState.pressed.some((t) => /^DMs/.test(t)), fuState);
+      await page.goto(BASE + '/#/today', { waitUntil: 'networkidle0' });
+      await wait('.counter-grid.four');
+    } else check('tapping a channel opens the Follow-ups page already filtered to it', false, 'no DMs chip');
     check('the call queue is no longer on Today', !todayInfo.hasQueue, 1);
     const sast = await page.evaluate(() => document.querySelector('.page-head .sub').textContent);
     check('my own time (SAST) is shown on Today', /SAST/.test(sast), sast);
 
     /* ---------- Follow-ups page ---------- */
-    await clickText(todayInfo.seeAll, 'a.btn');
+    await clickText('Start follow-ups', 'button.btn');
     await page.waitForFunction(() => location.hash === '#/followups', { timeout: 5000 });
     await wait('.seg');
     await sleep(500);
@@ -435,21 +451,147 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await shot('16-lead-email-mailbox');
 
     /* ---------- phone size ---------- */
-    await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
-    const overflow = {};
-    for (const [hash, sel, nm] of [['#/today', '.counter-grid.four', '20-today-phone'], ['#/calls', '.meter', '20b-calls-phone'], ['#/email', '.tiles', '20d-email-phone'], ['#/followups', '.seg', '20c-followups-phone'], ['#/leads', 'table.t', '21-leads-phone'], [leadHref.slice(leadHref.indexOf('#')), '.lead-grid', '22-lead-phone'], ['#/pipeline', '.board', '23-pipeline-phone'], ['#/stats', '.tiles', '24-stats-phone'], ['#/settings', '#s-script', '25-settings-phone'], ['#/import', '#imp-file', '26-import-phone']]) {
-      await page.goto(BASE + '/' + hash, { waitUntil: 'domcontentloaded' });
-      await page.reload({ waitUntil: 'domcontentloaded' });
-      await wait(sel);
-      await sleep(500);
-      overflow[nm] = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-      await shot(nm);
+    /* what a phone user would trip over: sideways scroll, controls under 44 px, inputs under 16 px (iOS zooms in on those) */
+    const probe = () => {
+      const vis = (e) => { if (e.classList.contains('sr-only')) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+      const dlg = document.querySelector('dialog[open]');
+      const sel = dlg ? 'dialog[open] button, dialog[open] select, dialog[open] input, dialog[open] textarea, dialog[open] summary' : 'main button, main a.btn, main select, main textarea, main input, main summary, .nav a, .topbar a';
+      const ctl = [...document.querySelectorAll(sel)].filter(vis);
+      const nm = (e) => ((e.getAttribute('aria-label') || e.textContent || e.id || e.tagName).trim().replace(/\s+/g, ' ').slice(0, 24)) + ' ' + Math.round(e.getBoundingClientRect().width) + 'x' + Math.round(e.getBoundingClientRect().height);
+      const small = ctl.filter((e) => {
+        const r = e.getBoundingClientRect();
+        if (e.type === 'file' || e.type === 'hidden') return false;
+        if (e.type === 'checkbox' || e.type === 'radio') { const lab = (e.id && document.querySelector('label[for="' + e.id + '"]')) || e.closest('label'); return !(lab && lab.getBoundingClientRect().height >= 43.5); }
+        if (e.tagName === 'INPUT' || e.tagName === 'SELECT' || e.tagName === 'TEXTAREA') return r.height < 43.5;
+        return r.height < 43.5 || r.width < 43.5;
+      }).map(nm);
+      const smallInput = ctl.filter((e) => /^(INPUT|SELECT|TEXTAREA)$/.test(e.tagName) && !['checkbox', 'radio', 'file'].includes(e.type) && parseFloat(getComputedStyle(e).fontSize) < 16).map(nm);
+      return { overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth, small, smallInput };
+    };
+    const PHONE_PAGES = [['#/today', '.counter-grid.four', 'today'], ['#/calls', '.meter', 'calls'], ['#/email', '.tiles', 'email'], ['#/followups', '.seg', 'followups'], ['#/leads', 'table.t', 'leads'], [leadHref.slice(leadHref.indexOf('#')), '.lead-grid', 'lead'], ['#/pipeline', '.board', 'pipeline'], ['#/stats', '.tiles', 'stats'], ['#/settings', '#s-script', 'settings'], ['#/import', '#imp-file', 'import']];
+    const problems = { overflow: {}, small: {}, smallInput: {} };
+    for (const [w, hgt] of [[390, 844], [360, 740]]) {
+      await page.setViewport({ width: w, height: hgt, isMobile: true, hasTouch: true, deviceScaleFactor: w === 390 ? 2 : 3 });
+      for (const [hash, sel, nm] of PHONE_PAGES) {
+        await page.goto(BASE + '/' + hash, { waitUntil: 'domcontentloaded' });
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await wait(sel);
+        await sleep(500);
+        if (nm === 'calls') {
+          for (const tab of ['Call queue', 'Scoreboard', 'Stats']) {
+            await clickText(tab, '.seg button');
+            await sleep(700);
+            const p = await page.evaluate(probe);
+            const key = w + ' calls ' + tab;
+            if (p.overflow > 1) problems.overflow[key] = p.overflow;
+            if (p.small.length) problems.small[key] = p.small.slice(0, 4);
+            if (p.smallInput.length) problems.smallInput[key] = p.smallInput.slice(0, 4);
+            if (w === 390) await shot('20b-calls-' + tab.toLowerCase().replace(' ', '-') + '-phone');
+          }
+          continue;
+        }
+        const p = await page.evaluate(probe);
+        const key = w + ' ' + nm;
+        if (p.overflow > 1) problems.overflow[key] = p.overflow;
+        if (p.small.length) problems.small[key] = p.small.slice(0, 4);
+        if (p.smallInput.length) problems.smallInput[key] = p.smallInput.slice(0, 4);
+        if (w === 390) await shot('2x-' + nm + '-phone');
+      }
     }
-    check('no page scrolls sideways on a phone', Object.values(overflow).every((v) => v <= 1), overflow);
+    check('no page scrolls sideways on a phone (360 and 390 wide, every page, all three Calls tabs)', Object.keys(problems.overflow).length === 0, problems.overflow);
+    check('every button, link, select and field on a phone is at least 44 px tall', Object.keys(problems.small).length === 0, problems.small);
+    check('every input, select and text box is 16px or larger, so iOS does not zoom in', Object.keys(problems.smallInput).length === 0, problems.smallInput);
+    await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
     const tabH = await page.evaluate(() => Math.min(...[...document.querySelectorAll('.nav a')].map((a) => a.getBoundingClientRect().height)));
     check('bottom tab buttons are at least 44px tall', tabH >= 44, tabH);
-    const smallTargets = await page.evaluate(() => [...document.querySelectorAll('main button, main a.btn, main select, main input')].filter((e) => e.offsetParent && !e.classList.contains('sm') && e.getBoundingClientRect().height < 36 && e.type !== 'checkbox' && e.type !== 'hidden').map((e) => e.textContent.trim().slice(0, 20) || e.tagName).slice(0, 6));
-    check('main controls on a phone are big enough to tap', smallTargets.length === 0, smallTargets);
+
+    /* Leads: the filters sit behind one button on a phone, and are open on a wide screen */
+    await page.goto(BASE + '/#/leads');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('table.t');
+    const fl = await page.evaluate(() => { const d = document.querySelector('details.filters'); return { open: d.open, summary: d.querySelector('summary').textContent.trim() }; });
+    check('on a phone the Leads filters start closed behind one "Filters and sort" button', fl.open === false && /^Filters and sort/.test(fl.summary), fl);
+    await page.evaluate(() => document.querySelector('details.filters > summary').click());
+    await sleep(200);
+    check('tapping it opens the filters, and they fit the screen', await page.evaluate(() => { const d = document.querySelector('details.filters'); const r = [...d.querySelectorAll('select')].map((e) => e.getBoundingClientRect()); return d.open && r.length === 7 && r.every((b) => b.right <= document.documentElement.clientWidth && b.height >= 44); }), 1);
+    await page.select('select[aria-label="All statuses"]', 'new');
+    await sleep(500);
+    check('an active filter shows a count on the closed button and survives a visit to a lead and back', await page.evaluate(() => document.querySelector('details.filters .pill-count').textContent === '1' && !document.querySelector('details.filters .pill-count').hidden), 1);
+    await page.select('select[aria-label="All statuses"]', '');
+    await sleep(300);
+
+    /* the lead page puts what you need mid-call first: the Call button, then Log, and the timeline comes after */
+    await page.goto(BASE + '/' + leadHref.slice(leadHref.indexOf('#')));
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.lead-grid');
+    const order = await page.evaluate(() => { const top = (s) => { const e = document.querySelector(s); return e ? e.getBoundingClientRect().top : null; }; return { call: top('.page-head a.btn[href^="tel:"]'), log: top('.s-log'), pipeline: top('.s-pipeline'), info: top('.s-info'), timeline: top('.s-timeline'), script: top('.s-script') }; });
+    check('lead page on a phone: Call button first, then Log a contact, then the timeline and the call script', order.call !== null && order.call < order.log && order.log < order.pipeline && order.pipeline < order.info && order.info < order.timeline && order.timeline < order.script, order);
+
+    /* opening a lead and coming back puts you where you were on the long list */
+    await page.goto(BASE + '/#/leads');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('table.t');
+    const rowsNow = await page.evaluate(() => document.querySelectorAll('table.t tbody tr').length);
+    await page.evaluate(() => window.scrollTo(0, 700));
+    await sleep(200);
+    const before = await page.evaluate(() => window.scrollY);
+    await page.evaluate(() => document.querySelectorAll('table.t tbody a')[Math.min(8, document.querySelectorAll('table.t tbody a').length - 1)].click());
+    await wait('.lead-grid');
+    await sleep(300);
+    await page.evaluate(() => [...document.querySelectorAll('a')].find((a) => a.textContent.trim() === 'All leads').click());
+    await wait('table.t');
+    await sleep(400);
+    const afterScroll = await page.evaluate(() => window.scrollY);
+    check('back from a lead returns to the same spot on the Leads list', before > 300 && Math.abs(afterScroll - before) < 40, { rowsNow, before, afterScroll });
+
+    /* dialogs on a phone: the primary button is always on screen, and a confirm box has no stray text */
+    await page.setViewport({ width: 360, height: 640, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+    await page.evaluate(() => document.querySelector('.topbar .btn').click());
+    await sleep(500);
+    const dl = await page.evaluate(() => { const d = document.querySelector('dialog[open]'); const b = [...d.querySelectorAll('button')].find((x) => x.type === 'submit'); const r = b.getBoundingClientRect(); const dr = d.getBoundingClientRect(); return { bottom: r.bottom, h: window.innerHeight, dw: dr.width, vw: document.documentElement.clientWidth, closeSize: d.querySelector('button[aria-label="Close"]').getBoundingClientRect().width }; });
+    check('Add lead on a small phone: the Add lead button is on screen without scrolling, and the sheet fits the width', dl.bottom <= dl.h && dl.dw <= dl.vw + 1, dl);
+    check('the dialog close button is at least 44 px', dl.closeSize >= 44, dl.closeSize);
+    const moreClosed = await page.evaluate(() => { const d = document.querySelector('dialog[open] details.more-fields'); return !!d && !d.open; });
+    check('the rarely used fields in Add lead are tucked under "More details" on a phone', moreClosed, 1);
+    await page.keyboard.press('Escape');
+    await sleep(300);
+    await page.goto(BASE + '/' + leadHref.slice(leadHref.indexOf('#')));
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.lead-grid');
+    await clickText('Delete', 'button');
+    await sleep(500);
+    const cf = await page.evaluate(() => { const d = document.querySelector('dialog[open]'); return d ? d.textContent : ''; });
+    check('a confirm box shows its message and no stray "null" text', /Delete/.test(cf) && !/null/.test(cf), cf.slice(0, 120));
+    await page.keyboard.press('Escape');
+    await sleep(300);
+    await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+
+    /* add to home screen, fonts, caching */
+    const head = await page.evaluate(() => ({
+      manifest: (document.querySelector('link[rel=manifest]') || {}).href, apple: (document.querySelector('link[rel=apple-touch-icon]') || {}).href,
+      theme: (document.querySelector('meta[name=theme-color]') || {}).content, cap: (document.querySelector('meta[name=apple-mobile-web-app-capable]') || {}).content,
+      title: (document.querySelector('meta[name=apple-mobile-web-app-title]') || {}).content, viewport: (document.querySelector('meta[name=viewport]') || {}).content,
+      googleLinks: document.querySelectorAll('link[href*="googleapis"], link[href*="gstatic"]').length,
+    }));
+    check('the page links a manifest, an apple-touch-icon, a theme colour and the standalone app tags', /\/manifest\.webmanifest$/.test(head.manifest || '') && /apple-touch-icon\.png$/.test(head.apple || '') && head.theme === '#fbfaf7' && head.cap === 'yes' && head.title === 'Lead Tracker', head);
+    check('the viewport allows the iPhone notch and home bar (viewport-fit=cover)', /viewport-fit=cover/.test(head.viewport), head.viewport);
+    check('no font or stylesheet is loaded from Google', head.googleLinks === 0 && external.length === 0, [head.googleLinks, external.slice(0, 3)]);
+    const mf = await page.evaluate(async () => { const r = await fetch('/manifest.webmanifest'); return { ok: r.ok, json: await r.json() }; });
+    const icons = mf.json.icons || [];
+    check('manifest: name, short name, standalone, start URL and background/theme colours match the app', mf.ok && mf.json.name === 'Lead Tracker' && mf.json.short_name === 'Lead Tracker' && mf.json.display === 'standalone' && mf.json.start_url === '/' && mf.json.background_color === '#fbfaf7' && mf.json.theme_color === '#fbfaf7', mf.json);
+    check('manifest has a 192 and a 512 PNG icon, one of them maskable', icons.some((i) => i.sizes === '192x192') && icons.some((i) => i.sizes === '512x512') && icons.some((i) => i.purpose === 'maskable'), icons);
+    const pngSize = async (u) => page.evaluate(async (url) => { const r = await fetch(url); const b = new Uint8Array(await r.arrayBuffer()); const sig = [137, 80, 78, 71].every((v, i) => b[i] === v); const dv = new DataView(b.buffer); return { ok: r.ok, type: r.headers.get('content-type'), sig, w: dv.getUint32(16), h: dv.getUint32(20) }; }, u);
+    const i192 = await pngSize('/icons/icon-192.png'), i512 = await pngSize('/icons/icon-512.png'), i180 = await pngSize('/icons/apple-touch-icon.png');
+    check('the three icon files exist and really are 192, 512 and 180 pixel PNGs', i192.ok && i192.sig && i192.w === 192 && i192.h === 192 && i512.ok && i512.w === 512 && i180.ok && i180.w === 180 && i180.h === 180 && /image\/png/.test(i192.type), [i192, i512, i180]);
+    const fontFiles = await page.evaluate(async () => { const out = []; for (const u of ['/fonts/plex-sans-var.woff2', '/fonts/plex-mono-400.woff2', '/fonts/plex-mono-500.woff2']) { const r = await fetch(u); out.push(r.ok && /font\/woff2/.test(r.headers.get('content-type') || '')); } return out; });
+    check('the three font files are served from this site as woff2', fontFiles.every(Boolean), fontFiles);
+    const usedFont = await page.evaluate(async () => { await document.fonts.ready; return document.fonts.check('16px "IBM Plex Sans"') && [...document.fonts].some((f) => f.family.includes('IBM Plex Sans') && f.status === 'loaded'); });
+    check('the app font is loaded from the site itself', usedFont, 1);
+    const vj = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'vercel.json'), 'utf8'));
+    const hdr = (src) => { const e = vj.headers.find((x) => x.source === src); return e ? Object.fromEntries(e.headers.map((k) => [k.key, k.value])) : null; };
+    check('vercel.json: fonts cache for a year, icons for a week, the manifest has its own type, scripts and the page always revalidate, the API is never cached',
+      /max-age=31536000, immutable/.test((hdr('/fonts/(.*)') || {})['Cache-Control']) && /max-age=604800/.test((hdr('/icons/(.*)') || {})['Cache-Control']) && (hdr('/manifest.webmanifest') || {})['Content-Type'] === 'application/manifest+json'
+      && /must-revalidate/.test((hdr('/(.*)\\.(js|css)') || {})['Cache-Control']) && /must-revalidate/.test((hdr('/') || {})['Cache-Control']) && (hdr('/api/(.*)') || {})['Cache-Control'] === 'no-store', vj.headers.map((x) => x.source));
     await page.goto(BASE + '/#/calls');
     await wait('.meter');
     await clickText('Call queue', '.seg button');

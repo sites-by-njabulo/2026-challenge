@@ -7,7 +7,7 @@ To put it online, follow [DEPLOY.md](DEPLOY.md). The local tracker in the `Lead 
 
 ## How it is built
 
-- `public/` the screens (plain HTML, CSS and ES modules, no build step). Vercel serves this folder as static files. Same screens as the local app.
+- `public/` the screens (plain HTML, CSS and ES modules, no build step). Vercel serves this folder as static files. Same screens as the local app. Built phone first: bottom tabs, 44 px tap targets, 16 px inputs, safe areas for the iPhone notch and home bar. Only Today loads up front, the other screens load the first time you open them. `manifest.webmanifest`, `icons/` and `fonts/` make it installable to the home screen; `scripts/make-icons.js` redraws the icons with plain Node.
 - `api/index.js` the one serverless function. `vercel.json` sends every `/api/*` request to it, with a 60 second limit.
 - `src/app.js` the whole API (routes, rules, import, export, Zapmail sync, login). One `(req, res)` handler.
 - `src/db.js` the only door to the database: `pg` over `DATABASE_URL` in production (one connection per instance, no named prepared statements, so it works with the Supabase pooler in transaction mode on port 6543).
@@ -59,7 +59,7 @@ npm run test:pg      both of those again through the real `pg` package over a Po
 npm run test:other   test/migrate.js (the copy-from-local script) and test/config.js (wrong-setup behaviour)
 ```
 
-`test/ui.js` needs Microsoft Edge and `puppeteer-core` (the path is at the top of that file).
+`test/ui.js` also checks the phone: no sideways scroll at 360 and 390 wide, every control at least 44 px, every input 16 px or more, the manifest, icons, fonts and `vercel.json` cache rules. It needs Microsoft Edge and `puppeteer-core` (the path is at the top of that file).
 
 ## Rules built in (unchanged)
 

@@ -9,7 +9,7 @@ export function inlineLog(l, defaultChannel, ctx) {
     compact: true, defaultChannel,
     onLogged: () => { ctx.open.delete(l.id); ctx.onLogged(); },
   }));
-  holder.append(h('div', { style: 'margin-top:10px' }, h('a', { href: '#/lead/' + l.id, class: 'small' }, 'More options on the lead page')));
+  holder.append(h('div', { style: 'margin-top:10px' }, h('a', { href: '#/lead/' + l.id, class: 'small linkbtn' }, 'More options on the lead page')));
   return holder;
 }
 export function toggleLog(l, li, defaultChannel, ctx) {
@@ -21,7 +21,7 @@ export function toggleLog(l, li, defaultChannel, ctx) {
 
 /* One follow-up: who, when it is due, Log and Open. Kept to two short lines. */
 export function followupRow(l, ctx) {
-  const li = h('li', { class: 'row nolamp' + (l.overdue ? ' overdue' : '') });
+  const li = h('li', { class: 'row nolamp fu' + (l.overdue ? ' overdue' : '') });
   const last = l.last_at ? 'Last: ' + Lib.CHANNEL_LABEL[l.last_channel] + ', ' + Lib.OUTCOME_LABEL[l.last_outcome] + ' · ' + ago(l.last_at) : 'Not contacted yet';
   li.append(
     h('div', { class: 'who' }, h('a', { href: '#/lead/' + l.id }, l.business_name), ' ', statusChip(l.status),

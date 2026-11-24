@@ -1,4 +1,7 @@
-import { h, Lib, api, toast, fmtDay, relDay, money, pct, loc, myTz, statusChip } from './ui.js';
+import { h, Lib, api, toast, fmtDay, relDay, money, pct, loc, myTz, statusChip, responsiveFold } from './ui.js';
+
+/* a section that starts closed on a phone (the long day-by-day tables), open on a wide screen */
+const foldSection = (title, ...kids) => responsiveFold(h('details', { class: 'fold section keep' }, h('summary', null, h('span', null, title)), h('div', { class: 'fold-body' }, ...kids)));
 
 function tiles(items) {
   return h('div', { class: 'tiles' }, ...items.map(([n, l]) => h('div', { class: 'tile' }, h('div', { class: 'n' }, n), h('div', { class: 'l' }, l))));
@@ -22,11 +25,11 @@ export async function renderStats(view) {
       [s.show_rate == null ? 'n/a' : pct(s.show_rate), 'Show rate'], [s.overdue_followups, 'Overdue follow-ups']]),
     h('p', { class: 'hint' }, s.definitions.responded + ' ' + s.definitions.replies + ' ' + s.definitions.booked),
 
-    h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'Last 14 days')),
+    foldSection('Last 14 days',
       dataTable([['Day'], ['Calls', true], ['DMs', true], ['Group', true], ['Email', true], ['Text', true], ['Replies', true], ['Booked', true]],
         [...s.daily].reverse().map((d) => [d.day === s.today ? 'Today' : fmtDay(d.day), barCell(d.calls, dmax), barCell(d.dms, dmax, true), d.groups, d.emails, d.texts, d.replies, d.booked]), { cards: true })),
 
-    h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'Last 8 weeks')),
+    foldSection('Last 8 weeks',
       dataTable([['Week'], ['Calls', true], ['DMs', true], ['Group', true], ['Email', true], ['Text', true], ['Replies', true], ['Booked', true]],
         [...s.weekly].reverse().map((d) => [wkLabel(d.week), barCell(d.calls, wmax), barCell(d.dms, wmax, true), d.groups, d.emails, d.texts, d.replies, d.booked]), { cards: true })),
 
@@ -35,7 +38,7 @@ export async function renderStats(view) {
         s.byChannel.map((c) => [c.label, c.attempts, c.leads, c.responded, pct(c.response_rate), c.booked, pct(c.booked_rate)]), { cards: true }),
       h('p', { class: 'hint', style: 'margin-top:8px' }, 'Rates are out of the leads you tried on that channel. A small sample moves a lot, so wait for a few dozen attempts before you trust a gap.')),
 
-    h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'By source')),
+    foldSection('By source',
       dataTable([['Source'], ['Leads', true], ['Contacted', true], ['Responded', true], ['Response rate', true], ['Booked', true], ['Booked rate', true], ['Closed', true]],
         s.bySource.map((c) => [c.label, c.leads, c.contacted, c.replied, pct(c.response_rate), c.booked, pct(c.booked_rate), c.closed]), { cards: true })),
 
@@ -59,12 +62,12 @@ export async function renderPipeline(view) {
     h('div', { class: 'board' }, ...p.board.map((st) => {
       const list = p.columns[st];
       return h('div', { class: 'col' }, h('h3', null, h('span', null, Lib.STATUS_LABEL[st]), h('span', { class: 'mono muted' }, p.counts[st])),
-        st === 'follow_up' && p.counts[st] ? h('div', { class: 'small', style: 'padding:8px 0 0' }, h('a', { href: '#/followups' }, 'Open the full follow-up list')) : null,
+        st === 'follow_up' && p.counts[st] ? h('div', { class: 'small', style: 'padding:8px 0 0' }, h('a', { href: '#/followups', class: 'linkbtn' }, 'Open the full follow-up list')) : null,
         ...(list.length ? list.slice(0, 60).map((l) => h('a', { class: 'card', href: '#/lead/' + l.id }, h('div', { class: 'nm' }, l.business_name, l.opted_out ? [' ', h('span', { class: 'chip optout flat' }, 'Opted out')] : ''),
           h('div', { class: 'muted small' }, [l.owner_name, l.trade, loc(l)].filter(Boolean).join(' · ')),
           l.deal_value ? h('div', { class: 'small mono' }, money(l.deal_value)) : '', !l.opted_out && l.next_followup ? h('div', { class: 'small ' + (l.next_followup < p.today ? 'err' : 'muted') }, 'Follow-up: ' + relDay(l.next_followup, p.today)) : '')) : [h('div', { class: 'empty muted small' }, 'None')]),
         p.counts[st] > list.length ? h('div', { class: 'small', style: 'padding-top:10px' }, '+ ' + (p.counts[st] - list.length) + ' more. ', h('a', { href: '#/leads?status=' + st }, 'See them in Leads')) : '');
     })),
-    h('p', { class: 'hint', style: 'margin-top:28px' }, 'Not on the board: ', h('a', { href: '#/leads?status=new' }, p.counts.new + ' new leads'), ' and ', h('a', { href: '#/leads?status=not_interested' }, p.counts.not_interested + ' not interested'), '.'));
+    h('p', { class: 'hint', style: 'margin-top:28px' }, 'Not on the board: ', h('a', { href: '#/leads?status=new', class: 'linkbtn' }, p.counts.new + ' new leads'), ' and ', h('a', { href: '#/leads?status=not_interested', class: 'linkbtn' }, p.counts.not_interested + ' not interested'), '.'));
 }
 void toast;

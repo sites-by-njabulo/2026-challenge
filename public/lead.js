@@ -6,10 +6,12 @@ const PREP = ['Their Google Business Profile is open', 'Their Maps ranking for t
 
 export async function renderLead(view, id) {
   let data;
-  try { data = await api('GET', '/api/leads/' + id); } catch (e) { view.append(h('div', { class: 'empty' }, e.message, ' ', h('a', { href: '#/leads' }, 'Back to leads'))); return undefined; }
+  try { data = await api('GET', '/api/leads/' + id); } catch (e) { view.append(h('div', { class: 'empty' }, e.message, ' ', h('a', { href: '#/leads', class: 'linkbtn' }, 'Back to leads'))); return undefined; }
   const root = h('div');
   view.append(root);
   let focusDeal = false;
+  let showAll = false;
+  const TL_SHOW = 8;
   const timers = [];
 
   async function reload(opts) {
@@ -33,11 +35,13 @@ export async function renderLead(view, id) {
     statusSel.value = l.status;
     statusSel.addEventListener('change', () => patch({ status: statusSel.value }, 'Status updated'));
     const header = h('div', { class: 'page-head' },
-      h('div', null, h('a', { href: '#/leads', class: 'small muted' }, 'All leads'), h('h1', { style: 'margin-top:6px' }, l.business_name),
+      h('div', null, h('a', { href: '#/leads', class: 'small muted linkbtn' }, 'All leads'), h('h1', { style: 'margin-top:6px' }, l.business_name),
         h('p', { class: 'sub' }, [l.owner_name, l.trade, loc(l)].filter(Boolean).join(' · ') || 'No details yet'),
         h('div', { class: 'actions', style: 'margin-top:10px' }, statusChip(l.status), l.opted_out ? h('span', { class: 'chip optout flat' }, 'Opted out') : null, l.is_demo ? h('span', { class: 'chip demo' }, 'Demo lead') : null),
-        h('div', { class: 'actions', style: 'margin-top:10px' }, h('span', { class: 'muted small' }, 'Contacted via'), channelChips(viaList()))),
+        h('div', { class: 'actions', style: 'margin-top:10px' }, h('span', { class: 'muted small' }, 'Contacted via'), channelChips(viaList())),
+        w && !l.opted_out ? h('div', { style: 'margin-top:10px' }, windowMarker(w)) : null),
       h('div', { class: 'actions' },
+        l.phone && !l.opted_out ? h('a', { class: 'btn ' + (w && !w.ok ? 'ghost' : 'lampbtn'), href: 'tel:+1' + Lib.normPhone(l.phone), 'aria-label': 'Call ' + l.business_name }, icon('phone', 18), 'Call') : null,
         h('button', { class: 'btn ghost', type: 'button', onclick: () => openLeadForm({ lead: l, onSaved: () => reload() }) }, icon('edit', 18), 'Edit'),
         h('button', { class: 'btn danger', type: 'button', onclick: () => deleteLead() }, icon('trash', 18), 'Delete')));
 
@@ -52,7 +56,7 @@ export async function renderLead(view, id) {
     const fuInput = h('input', { class: 'input', type: 'date', value: l.next_followup || '', 'aria-label': 'Next follow-up date', disabled: l.opted_out });
     fuInput.addEventListener('change', () => patch({ next_followup: fuInput.value || null }, 'Follow-up saved'));
     const chip = (label, days) => h('button', { class: 'btn ghost sm', type: 'button', disabled: l.opted_out, onclick: () => patch({ next_followup: days == null ? null : Lib.addBizDays(today, days) }, days == null ? 'Follow-up cleared' : 'Follow-up set') }, label);
-    const pipeline = h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'Pipeline')),
+    const pipeline = h('section', { class: 'section s-pipeline' }, h('div', { class: 'sec-head' }, h('h2', null, 'Pipeline')),
       h('div', { class: 'grid2', style: 'padding-top:14px' },
         h('div', { class: 'field' }, h('label', null, 'Status'), statusSel),
         h('div', { class: 'field' }, h('label', null, 'Next follow-up'), fuInput)),
@@ -60,18 +64,20 @@ export async function renderLead(view, id) {
         l.next_followup && !l.opted_out ? h('span', { class: 'muted small' }, relDay(l.next_followup, today)) : null));
 
     /* log + timeline */
-    const logSec = h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'Log a contact')),
+    const logSec = h('section', { class: 'section s-log' }, h('div', { class: 'sec-head' }, h('h2', null, 'Log a contact')),
       h('div', { style: 'padding-top:14px' }, logPanel(l, { onLogged: (res, info) => reload({ focusDeal: info && info.outcome === 'booked' }) })));
 
     const events = [
       ...data.contacts.map((c) => ({ kind: 'c', at: c.at, c })),
       ...data.optouts.flatMap((o) => [{ kind: 'o', at: o.at, o }, ...(o.removed_at ? [{ kind: 'r', at: o.removed_at, o }] : [])]),
     ].sort((a, b) => (a.at < b.at ? 1 : -1));
-    const tl = events.length ? h('ol', { class: 'timeline' }, ...events.map(eventNode)) : h('div', { class: 'empty' }, 'Nothing logged yet. Tap an outcome above after your first attempt.');
-    const timeline = h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'Timeline'), h('span', { class: 'count' }, data.contacts.length + ' contact' + (data.contacts.length === 1 ? '' : 's'))), h('div', { style: 'padding-top:16px' }, tl));
+    const shown = showAll ? events : events.slice(0, TL_SHOW);
+    const tl = events.length ? h('ol', { class: 'timeline' }, ...shown.map(eventNode)) : h('div', { class: 'empty' }, 'Nothing logged yet. Tap an outcome above after your first attempt.');
+    const timeline = h('section', { class: 'section s-timeline' }, h('div', { class: 'sec-head' }, h('h2', null, 'Timeline'), h('span', { class: 'count' }, data.contacts.length + ' contact' + (data.contacts.length === 1 ? '' : 's'))), h('div', { style: 'padding-top:16px' }, tl,
+      events.length > shown.length ? h('button', { class: 'btn ghost', type: 'button', onclick: () => { showAll = true; draw(); } }, 'Show ' + (events.length - shown.length) + ' older') : null));
 
     /* right column */
-    const info = h('section', null, h('div', { class: 'sec-head' }, h('h2', null, 'Contact')),
+    const info = h('section', { class: 's-info' }, h('div', { class: 'sec-head' }, h('h2', null, 'Contact')),
       h('dl', { class: 'kv', style: 'padding-top:14px' },
         h('dt', null, 'Phone'), h('dd', null, telLink(l.phone)),
         h('dt', null, 'Email'), h('dd', null, l.email ? h('a', { href: 'mailto:' + l.email }, l.email) : h('span', { class: 'muted' }, 'None')),
@@ -86,7 +92,7 @@ export async function renderLead(view, id) {
     const compDate = h('input', { class: 'input', type: 'date', value: l.competitor_checked_date || '', 'aria-label': 'Date checked' });
     const compName = h('input', { class: 'input', value: l.competitor_checked || '', placeholder: 'Who ranks above them, and for what search', 'aria-label': 'Competitor checked' });
     const saveComp = () => patch({ competitor_checked: compName.value, competitor_checked_date: compDate.value || null }, 'Saved');
-    const helper = h('section', null, h('div', { class: 'sec-head' }, h('h2', null, 'Call helper')),
+    const helper = h('section', { class: 's-helper' }, h('div', { class: 'sec-head' }, h('h2', null, 'Call helper')),
       h('div', { style: 'display:grid;gap:12px;padding-top:14px' },
         h('div', { class: 'field' }, h('label', null, 'Competitor I checked'), compName),
         h('div', { class: 'field' }, h('label', null, 'Date I checked it'), compDate),
@@ -103,7 +109,7 @@ export async function renderLead(view, id) {
         try { state.settings = await api('PUT', '/api/settings', { call_script: scriptEdit.value }); toast('Script saved'); draw(); } catch (e) { toast(e.message, { error: true }); }
       }
     });
-    const script = h('section', null, h('div', { class: 'sec-head' }, h('h2', null, 'Call script'), scriptBtn), h('div', { style: 'padding-top:14px' }, scriptBox, scriptEdit));
+    const script = h('section', { class: 's-script' }, h('div', { class: 'sec-head' }, h('h2', null, 'Call script'), scriptBtn), h('div', { style: 'padding-top:14px' }, scriptBox, scriptEdit));
 
     const dealSec = dealSection(l);
     const optSec = optSection(l);
@@ -190,7 +196,7 @@ export async function renderLead(view, id) {
       } catch (e) { toast(e.message, { error: true }); }
     });
     const summary = d.signed_date ? 'Signed ' + money(d.deal_value) : d.deal_value ? 'Value ' + money(d.deal_value) : d.call_at ? 'Call booked' : 'Not started';
-    return h('details', { class: 'fold deal', open: !!(data.deal) }, h('summary', null, h('span', null, 'Booked call and deal'), h('span', { class: 'muted', style: 'text-transform:none;letter-spacing:0;font-weight:400' }, summary)),
+    return h('details', { class: 'fold deal s-deal', open: !!(data.deal) }, h('summary', null, h('span', null, 'Booked call and deal'), h('span', { class: 'muted', style: 'text-transform:none;letter-spacing:0;font-weight:400' }, summary)),
       h('div', { class: 'fold-body' }, f('Booked call (your time, ' + Lib.tzAbbr(new Date(), myTz()) + ')', call, 'd-call'), f('Call result', result, 'd-res'), f('Proposal sent', proposal, 'd-prop'),
         h('div', { class: 'grid2' }, f('Deposit paid on', depDate, 'd-depd'), f('Deposit amount (USD)', depAmt, 'd-depa')),
         h('div', { class: 'grid2' }, f('Client signed on', signed, 'd-sign'), f('Deal value (USD)', value, 'd-val')), save));
@@ -198,14 +204,14 @@ export async function renderLead(view, id) {
 
   function optSection(l) {
     if (l.opted_out) {
-      return h('details', { class: 'fold' }, h('summary', null, 'Opt-out'),
+      return h('details', { class: 'fold s-opt' }, h('summary', null, 'Opt-out'),
         h('div', { class: 'fold-body' }, h('p', null, 'Opted out on ' + fmtDateTime(l.opt_out_date) + (l.opt_out_channel === 'all' ? ' (all channels).' : ' via ' + Lib.CHANNEL_LABEL[l.opt_out_channel] + '.')),
           h('p', { class: 'hint' }, 'Removing an opt-out makes this business contactable again. Only do it if they asked to be contacted. The history stays on the timeline.'),
           h('button', { class: 'btn danger', type: 'button', onclick: removeOpt }, 'Remove opt-out')));
     }
     const ch = h('select', { class: 'input', id: 'oo-ch' }, h('option', { value: 'all' }, 'All channels'), ...Lib.CHANNELS.map((c) => h('option', { value: c.id }, 'Asked on: ' + c.label)));
     const note = h('input', { class: 'input', id: 'oo-note', placeholder: 'What they said (optional)' });
-    return h('details', { class: 'fold' }, h('summary', null, 'Opt-out'),
+    return h('details', { class: 'fold s-opt' }, h('summary', null, 'Opt-out'),
       h('div', { class: 'fold-body' }, h('p', { class: 'hint' }, 'If they ask not to be contacted, mark it here. This blocks every channel at once and removes them from every queue. Source and date are recorded.'),
         h('div', { class: 'field' }, h('label', { for: 'oo-ch' }, 'Channel they said it on'), ch), h('div', { class: 'field' }, h('label', { for: 'oo-note' }, 'Note'), note),
         h('button', { class: 'btn danger', type: 'button', onclick: async () => {

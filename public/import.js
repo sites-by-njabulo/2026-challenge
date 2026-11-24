@@ -23,7 +23,7 @@ export async function renderImport(view) {
   const body = h('div');
   view.append(h('div', { class: 'page-head' }, h('div', null, h('h1', null, 'Import CSV'), h('p', { class: 'sub' }, 'Match your columns, see the duplicates, then import. Nothing is added until you confirm.')), h('a', { class: 'btn ghost', href: '#/leads' }, 'Back to leads')), body);
 
-  const stepBar = () => h('div', { class: 'steps' }, ...['1 Choose file', '2 Match columns', '3 Check duplicates', '4 Done'].map((t, i) => h('span', { class: st.step === i + 1 ? 'on' : '' }, t)));
+  const stepBar = () => h('div', { class: 'steps' }, ...['1 Choose file', '2 Match columns', '3 Check duplicates', '4 Done'].map((t, i) => h('span', { class: st.step === i + 1 ? 'on' : '' }, t.slice(0, 1), ' ', h('em', null, t.slice(2)))));
 
   function guess() {
     const norm = (s) => Lib.alnum(s);
@@ -44,7 +44,7 @@ export async function renderImport(view) {
   function stepFile() {
     st.step = 1;
     const file = h('input', { type: 'file', accept: '.csv,.txt,text/csv', id: 'imp-file', class: 'input' });
-    const paste = h('textarea', { class: 'input', rows: 6, id: 'imp-paste', placeholder: 'Or paste CSV text here, first row = column names' });
+    const paste = h('textarea', { class: 'input', rows: 6, id: 'imp-paste', placeholder: 'Or paste CSV text here, first row = column names', 'aria-label': 'Paste CSV text', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false' });
     const err = h('div', { class: 'err', role: 'alert' });
     const go = (text, name) => {
       const rows = Lib.parseCSV(text);
@@ -114,7 +114,7 @@ export async function renderImport(view) {
       h('div', { class: 'tiles' }, ...[[c.new, 'New'], [c.dup, 'Duplicates'], [c.dup_in_file, 'Repeats in file'], [c.optout, 'Blocked (opted out)'], [c.invalid, 'Invalid']].map(([n, l]) => h('div', { class: 'tile' }, h('div', { class: 'n' }, n), h('div', { class: 'l' }, l)))),
       h('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:16px 0' }, h('label', { for: 'imp-mode', class: 'label' }, 'Duplicates:'), mode, btn, h('button', { class: 'btn ghost', type: 'button', onclick: stepMap }, 'Back')),
       h('p', { class: 'hint' }, 'A duplicate is the same phone, the same website, or the same business name in the same city. Businesses that asked to opt out are never imported.'),
-      h('div', { class: 'table-wrap', style: 'margin-top:12px' }, h('table', { class: 't' },
+      h('div', { class: 'table-wrap', style: 'margin-top:12px' }, h('table', { class: 't wide' },
         h('thead', null, h('tr', null, ...['Row', 'Business', 'Where', 'Phone', 'Result'].map((t) => h('th', null, t)))),
         h('tbody', null, ...shown.map((r) => h('tr', null, h('td', { class: 'mono' }, r.i + 2), h('td', null, r.lead.business_name || h('span', { class: 'muted' }, '(none)')), h('td', null, loc(r.lead)), h('td', { class: 'mono' }, r.lead.phone || ''),
           h('td', null, h('span', { class: 'chip flat ' + (r.status === 'new' ? 'ok' : r.status === 'invalid' || r.status === 'optout' ? 'optout' : 'dup') }, STATUS_TEXT[r.status]),

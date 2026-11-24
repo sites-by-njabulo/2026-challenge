@@ -1,8 +1,8 @@
-import { h, Lib, icon, api, toast, fmtDay, pct, debounce } from './ui.js';
+import { h, Lib, icon, api, toast, fmtDay, pct, debounce, autoRefresh } from './ui.js';
 import { queueRow, closedRow, noTzRow } from './rows.js';
 
-const PAGE = 40;
-const ui = { tab: 'queue', period: 'today', day: null };
+const PAGE = 20;
+const ui = { tab: 'queue', period: 'today', day: null, limit: PAGE };
 const hourLabel = (hr) => ((hr % 12) || 12) + (hr < 12 ? ' AM' : ' PM');
 
 function dialsMeter(value, target) {
@@ -22,12 +22,11 @@ const COUNTERS = [
 export async function renderCalls(view) {
   const body = h('div');
   const open = new Set();
-  let readyLimit = PAGE;
   let data = null;
   view.append(h('div', { class: 'page-head' }, h('div', null, h('h1', null, 'Calls'), h('p', { class: 'sub' }, 'Who to call right now, your daily scoreboard, and how your calling is going.'))), body);
 
   async function load() {
-    try { data = await api('GET', '/api/calls?period=' + ui.period + '&ready_limit=' + readyLimit); } catch (e) { toast(e.message, { error: true }); return; }
+    try { data = await api('GET', '/api/calls?period=' + ui.period + '&ready_limit=' + ui.limit); } catch (e) { toast(e.message, { error: true }); return; }
     draw();
   }
 
@@ -46,7 +45,7 @@ export async function renderCalls(view) {
       h('div', { class: 'sec-head' }, h('h2', null, 'OK to call now'), h('span', { class: 'count' }, q.ready_total + ' ready')),
       h('p', { class: 'hint', style: 'margin:8px 0 0' }, 'Only leads inside the calling window (' + hourLabel(data.window.start) + ' to ' + hourLabel(data.window.end) + ', their local time). Calls are manual: tap Call, then tap what happened.'),
       q.ready.length ? h('ul', { class: 'ledger' }, ...q.ready.map((l) => queueRow(l, now, data.window, ctx))) : h('div', { class: 'empty' }, q.later_total || q.no_tz_total ? 'No one is in the calling window right now. The next leads open soon, see below.' : 'No leads with a phone number to call. Add leads or import a CSV.'),
-      q.ready_total > q.ready.length ? h('div', { style: 'padding-top:20px' }, h('button', { class: 'btn ghost sm', type: 'button', onclick: () => { readyLimit += PAGE; load(); } }, 'Show ' + Math.min(PAGE, q.ready_total - q.ready.length) + ' more')) : null));
+      q.ready_total > q.ready.length ? h('div', { style: 'padding-top:20px' }, h('button', { class: 'btn ghost sm', type: 'button', onclick: () => { ui.limit += PAGE; load(); } }, 'Show ' + Math.min(PAGE, q.ready_total - q.ready.length) + ' more')) : null));
     if (q.later_total) {
       out.push(h('details', { class: 'fold section' }, h('summary', null, h('span', null, 'Outside calling hours'), h('span', { class: 'count mono' }, q.later_total)),
         h('div', { class: 'fold-body' }, h('ul', { class: 'ledger' }, ...q.later.map((l) => closedRow(l, now, data.window))))));
@@ -108,7 +107,7 @@ export async function renderCalls(view) {
           h('div', { class: 'hint', 'data-note': key, style: 'min-height:18px' }, day.auto[key] ? day.auto[key] + ' counted from calls you logged on leads' : ''),
           h('div', { class: 'hint tip' }, hint));
       }));
-      const verdict = h('textarea', { class: 'input', id: 'verdict', rows: 5, placeholder: 'How did today go? What worked, what did not, what will you change tomorrow?' }, day.verdict);
+      const verdict = h('textarea', { class: 'input', id: 'verdict', 'aria-label': 'Verdict of the day', rows: 5, placeholder: 'How did today go? What worked, what did not, what will you change tomorrow?' }, day.verdict);
       const saveVerdict = debounce(async () => { try { await api('PUT', '/api/calls/day', { day: day.day, verdict: verdict.value }); flash(); } catch (e) { toast(e.message, { error: true }); } }, 600);
       verdict.addEventListener('input', saveVerdict);
       holder.replaceChildren(
@@ -154,7 +153,7 @@ export async function renderCalls(view) {
   }
 
   await load();
-  const timer = setInterval(() => { if (!document.hidden && ui.tab === 'queue' && !body.querySelector('.inline-log') && !document.querySelector('dialog[open]')) load(); }, 30000);
+  const stop = autoRefresh(load, 60000, () => ui.tab !== 'queue' || body.querySelector('.inline-log') || document.querySelector('dialog[open]'));
   void toast;
-  return () => clearInterval(timer);
+  return stop;
 }

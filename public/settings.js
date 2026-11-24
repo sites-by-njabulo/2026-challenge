@@ -5,7 +5,7 @@ const TZ_OPTIONS = ['Africa/Johannesburg', 'America/New_York', 'America/Chicago'
 export async function renderSettings(view, ctx) {
   const s = state.settings;
   const fld = (id, label, el, hint) => h('div', { class: 'field' }, h('label', { for: id }, label), el, hint ? h('p', { class: 'hint' }, hint) : null);
-  const num = (id, v) => h('input', { class: 'input', id, type: 'number', min: '0', step: '1', value: v });
+  const num = (id, v) => h('input', { class: 'input', id, type: 'number', inputmode: 'numeric', min: '0', step: '1', value: v });
   const calls = num('s-calls', s.daily_call_target), dms = num('s-dms', s.daily_dm_target);
   const goalAmt = num('s-goal', s.goal_amount);
   const goalDate = h('input', { class: 'input', id: 's-gdate', type: 'date', value: s.goal_date });
@@ -48,13 +48,13 @@ export async function renderSettings(view, ctx) {
 }
 
 function passwordForm() {
-  const o = h('input', { class: 'input', id: 'pw-old', type: 'password', autocomplete: 'current-password' });
-  const n = h('input', { class: 'input', id: 'pw-new', type: 'password', autocomplete: 'new-password' });
+  const o = h('input', { class: 'input', id: 'pw-old', name: 'password', type: 'password', autocomplete: 'current-password' });
+  const n = h('input', { class: 'input', id: 'pw-new', name: 'new-password', type: 'password', autocomplete: 'new-password' });
   const err = h('div', { class: 'err', role: 'alert' });
   return h('form', { style: 'display:grid;gap:14px', onsubmit: async (e) => {
     e.preventDefault(); err.textContent = '';
     try { await api('POST', '/api/password', { old: o.value, new: n.value }); toast('Password changed'); o.value = ''; n.value = ''; } catch (ex) { err.textContent = ex.message; }
-  } }, h('div', { class: 'field' }, h('label', { for: 'pw-old' }, 'Current password'), o), h('div', { class: 'field' }, h('label', { for: 'pw-new' }, 'New password (8 or more characters)'), n), err,
+  } }, h('input', { class: 'sr-only', type: 'text', name: 'username', autocomplete: 'username', value: 'lead-tracker', tabindex: '-1', 'aria-hidden': 'true' }), h('div', { class: 'field' }, h('label', { for: 'pw-old' }, 'Current password'), o), h('div', { class: 'field' }, h('label', { for: 'pw-new' }, 'New password (8 or more characters)'), n), err,
     h('div', null, h('button', { class: 'btn', type: 'submit' }, 'Change password')));
 }
 void Lib;
