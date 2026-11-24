@@ -61,6 +61,16 @@ npm run test:other   test/migrate.js (the copy-from-local script) and test/confi
 
 `test/ui.js` also checks the phone: no sideways scroll at 360 and 390 wide, every control at least 44 px, every input 16 px or more, the manifest, icons, fonts and `vercel.json` cache rules. It needs Microsoft Edge and `puppeteer-core` (the path is at the top of that file).
 
+## Owner odds
+
+Each lead can carry **Owner odds** (High, Medium or Low): how likely it is that the person who answers the phone is the owner. It comes in with the CSV import (columns `owner_odds` and `owner_odds_score`, score 0 to 100; "High", "med" and "medium" are all understood, anything else is left empty) or you set it by hand on the lead page or in Add/Edit lead.
+
+- Leads, Calls queue and Follow-ups show a small chip ("High odds") on each lead that has it. Today does not.
+- Leads, behind "Filters and sort": an **Owner odds** filter and the sort **Best odds first** (High, then Medium, then Low, then none, best score first). The API takes `owner_odds=HIGH|MEDIUM|LOW|none` and `sort=odds`.
+- The Calls queue lists High first, then Medium, then Low, then leads with no odds, and keeps the old order inside each group. Who is in the queue and every count stay exactly as before.
+- Import in "Fill blank fields" mode only fills odds on leads that have none (the score goes with it).
+- Database: two optional columns on `leads` (`owner_odds TEXT`, `owner_odds_score INTEGER`). `src/schema.js` adds them with `ADD COLUMN IF NOT EXISTS` on the first request after a deploy, so the existing Supabase table keeps all its rows. Nothing to run by hand.
+
 ## Rules built in (unchanged)
 
 - No automated sending of anything. You log DMs and emails by hand. Calls are manual.

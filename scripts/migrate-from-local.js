@@ -9,6 +9,7 @@
    Preview (writes nothing):   node --no-warnings scripts/migrate-from-local.js "<path to tracker or backup .db>"
    Really copy it:             node --no-warnings scripts/migrate-from-local.js "<path to .db>" --commit
    Needs DATABASE_URL in the environment (the same Supabase string the site uses).
+   Columns are matched by name, so owner_odds and owner_odds_score are copied too if the old file has them (the older local tracker does not).
    Not copied on purpose: the old password (you set a new one), sessions, and the saved Zapmail key (paste it again on the Email page). */
 const db = require('../src/db');
 const { ensureSchema } = require('../src/schema');

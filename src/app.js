@@ -56,7 +56,8 @@ const safeEqual = (a, b) => {
 };
 
 const TEXT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'competitor_checked', 'external_id'];
-const LEAD_COLS = [...TEXT_FIELDS, 'phone_norm', 'email_norm', 'website_norm', 'name_city_key', 'status', 'next_followup', 'competitor_checked_date',
+const ODDS_FIELDS = ['owner_odds', 'owner_odds_score'];
+const LEAD_COLS = [...TEXT_FIELDS, ...ODDS_FIELDS, 'phone_norm', 'email_norm', 'website_norm', 'name_city_key', 'status', 'next_followup', 'competitor_checked_date',
   'opted_out', 'opt_out_date', 'opt_out_channel', 'is_demo', 'created_at', 'updated_at'];
 
 function sourceId(v) {
@@ -66,10 +67,32 @@ function sourceId(v) {
   return null;
 }
 
+/* Owner odds: how likely it is that the person who answers the phone is the owner. HIGH, MEDIUM or LOW, anything else is empty. */
+function normOdds(v) {
+  const t = String(v == null ? '' : v).trim().toUpperCase();
+  if (!t) return null;
+  if (t === 'HIGH' || t === 'H') return 'HIGH';
+  if (t === 'MEDIUM' || t === 'MED' || t === 'MID' || t === 'M') return 'MEDIUM';
+  if (t === 'LOW' || t === 'L') return 'LOW';
+  return null;
+}
+function normOddsScore(v) {
+  if (v == null || typeof v === 'boolean') return null;
+  const t = String(v).trim();
+  if (!/^\d+(\.0+)?$/.test(t)) return null;
+  const n = Number(t);
+  return n >= 0 && n <= 100 ? n : null;
+}
+const ODDS_RANK_SQL = "CASE l.owner_odds WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 WHEN 'LOW' THEN 2 ELSE 3 END";
+const oddsRank = (o) => (o === 'HIGH' ? 0 : o === 'MEDIUM' ? 1 : o === 'LOW' ? 2 : 3);
+
 /* Take loose input, return a clean, normalised lead object (only keys present in `input` for updates). */
 function normaliseLead(input, base) {
   const f = { ...(base || {}) };
   for (const k of TEXT_FIELDS) if (k in input) f[k] = clean(input[k]);
+  if ('owner_odds' in input) f.owner_odds = normOdds(input.owner_odds);
+  if ('owner_odds_score' in input) f.owner_odds_score = normOddsScore(input.owner_odds_score);
+  else if ('owner_odds' in input && !f.owner_odds) f.owner_odds_score = null; // clearing the odds clears the score with it
   if ('state' in input && f.state) f.state = Lib.normState(f.state);
   if ('source' in input) f.source = sourceId(f.source) || (f.source ? 'other' : null);
   if ('status' in input && input.status) {
@@ -236,6 +259,8 @@ async function listLeads(q) {
   for (const k of ['status', 'trade', 'source', 'batch', 'state']) if (q[k]) { where.push(`l.${k} = ?`); args.push(q[k]); }
   if (q.channel === 'none') where.push('NOT EXISTS (SELECT 1 FROM contacts cc WHERE cc.lead_id = l.id)');
   else if (q.channel) { where.push('EXISTS (SELECT 1 FROM contacts cc WHERE cc.lead_id = l.id AND cc.channel = ?)'); args.push(q.channel); }
+  if (q.owner_odds === 'none') where.push('l.owner_odds IS NULL');
+  else if (normOdds(q.owner_odds)) { where.push('l.owner_odds = ?'); args.push(normOdds(q.owner_odds)); }
   if (q.opted === '1') where.push('l.opted_out = 1');
   if (q.opted === '0') where.push('l.opted_out = 0');
   if (q.demo === '1') where.push('l.is_demo = 1');
@@ -246,6 +271,7 @@ async function listLeads(q) {
     recent: 'l.created_at DESC, l.id DESC',
     followup: '(l.next_followup IS NULL), l.next_followup ASC, l.id ASC',
     touched: 'last_at DESC NULLS LAST, l.id DESC',
+    odds: ODDS_RANK_SQL + ', l.owner_odds_score DESC NULLS LAST, l.created_at DESC, l.id DESC',
   }[q.sort] || 'l.created_at DESC, l.id DESC';
   const limit = Math.min(Number(q.limit) || 200, 1000), offset = Number(q.offset) || 0;
   const rows = await db.all(LEAD_LIST_SQL + w + ' ORDER BY ' + sort + ' LIMIT ? OFFSET ?', ...args, limit, offset);
@@ -332,6 +358,7 @@ function leadLite(r, now, s) {
   const w = Lib.okToCall(now, tz, s.call_window_start, s.call_window_end);
   return {
     id: r.id, business_name: r.business_name, owner_name: r.owner_name, phone: r.phone, city: r.city, state: r.state, trade: r.trade,
+    owner_odds: r.owner_odds || null, owner_odds_score: r.owner_odds_score == null ? null : r.owner_odds_score,
     status: r.status, next_followup: r.next_followup, tz, competitor_checked: r.competitor_checked, competitor_checked_date: r.competitor_checked_date,
     last_at: r.last_at, last_channel: r.last_channel, last_outcome: r.last_outcome, contact_count: r.contact_count,
     window: w,
@@ -491,7 +518,8 @@ async function callsData(now, period, readyLimit) {
   const tz = s.my_timezone;
   const today = Lib.dayKey(now, tz);
   const cands = (await db.all(LEAD_LIST_SQL + ` WHERE ${CALL_ELIGIBLE} AND (l.next_followup IS NULL OR l.next_followup <= ?)`, today)).map((r) => leadLite(r, now, s));
-  const ready = cands.filter((l) => l.window.ok).sort((a, b) => a.window.minsLeft - b.window.minsLeft || a.id - b.id);
+  // best owner odds first (HIGH, MEDIUM, LOW, none), and inside each group the same order as before
+  const ready = cands.filter((l) => l.window.ok).sort((a, b) => oddsRank(a.owner_odds) - oddsRank(b.owner_odds) || a.window.minsLeft - b.window.minsLeft || a.id - b.id);
   const later = cands.filter((l) => !l.window.ok && !l.window.unknown).sort((a, b) => a.window.minsUntilOpen - b.window.minsUntilOpen || a.id - b.id);
   const noTz = cands.filter((l) => l.window.unknown);
 
@@ -799,7 +827,7 @@ async function zapmailStatus() {
 }
 
 /* ---------------- import ---------------- */
-const IMPORT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'external_id'];
+const IMPORT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'external_id', 'owner_odds', 'owner_odds_score'];
 async function importPrepare(rows, defaults) {
   const seen = { phone: new Map(), site: new Map(), key: new Map() };
   const out = [];
@@ -848,7 +876,7 @@ async function importPreview(b) {
   return {
     counts,
     rows: rows.map((r) => ({ i: r.i, status: r.status, reason: r.reason || null, file_dup_of: r.file_dup_of,
-      lead: { business_name: r.lead.business_name, owner_name: r.lead.owner_name, phone: r.lead.phone, email: r.lead.email, website: r.lead.website, city: r.lead.city, state: r.lead.state, trade: r.lead.trade, source: r.lead.source },
+      lead: { business_name: r.lead.business_name, owner_name: r.lead.owner_name, phone: r.lead.phone, email: r.lead.email, website: r.lead.website, city: r.lead.city, state: r.lead.state, trade: r.lead.trade, source: r.lead.source, owner_odds: r.lead.owner_odds || null, owner_odds_score: r.lead.owner_odds_score == null ? null : r.lead.owner_odds_score },
       matches: (r.matches || []).map((m) => ({ id: m.lead.id, business_name: m.lead.business_name, city: m.lead.city, reasons: m.reasons })),
       optouts: (r.optouts || []).map((o) => ({ business_name: o.business_name, at: o.at })) })),
   };
@@ -874,6 +902,9 @@ async function importCommit(b) {
           const target = await getLeadRow(r.matches[0].lead.id);
           const patch = {};
           for (const k of TEXT_FIELDS) if (!target[k] && r.lead[k]) patch[k] = r.lead[k];
+          // owner odds and its score go together: both fill in when the lead has no odds yet; the score alone fills in only when it belongs to the same odds
+          if (target.owner_odds == null && r.lead.owner_odds != null) { patch.owner_odds = r.lead.owner_odds; if (r.lead.owner_odds_score != null) patch.owner_odds_score = r.lead.owner_odds_score; }
+          else if (target.owner_odds != null && target.owner_odds === r.lead.owner_odds && target.owner_odds_score == null && r.lead.owner_odds_score != null) patch.owner_odds_score = r.lead.owner_odds_score;
           const merged = normaliseLead(patch, target);
           if (Object.keys(patch).length) { await writeLead(target.id, merged); res.updated++; } else res.skipped_duplicates++;
         } else res.skipped_duplicates++;
@@ -888,7 +919,7 @@ async function importCommit(b) {
 /* ---------------- export ---------------- */
 const BOM = '﻿';
 async function csvLeads() {
-  const cols = ['id', 'business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'status', 'next_followup', 'competitor_checked', 'competitor_checked_date', 'opted_out', 'opt_out_date', 'opt_out_channel', 'external_id', 'is_demo', 'created_at', 'updated_at'];
+  const cols = ['id', 'business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'owner_odds', 'owner_odds_score', 'status', 'next_followup', 'competitor_checked', 'competitor_checked_date', 'opted_out', 'opt_out_date', 'opt_out_channel', 'external_id', 'is_demo', 'created_at', 'updated_at'];
   const rows = await db.all('SELECT * FROM leads ORDER BY id');
   return Lib.toCSV([cols, ...rows.map((r) => cols.map((c) => r[c]))]);
 }

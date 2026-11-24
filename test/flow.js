@@ -466,6 +466,126 @@ async function wholeDatabaseText() {
     check('daily targets can be changed', r.json.daily_call_target === 60 && r.json.daily_dm_target === 25, r.json);
     check('targets start at 50 calls and 30 DMs by default', (await call('GET', '/api/settings')).json.daily_call_target === 60, 1);
 
+    /* ---------- owner odds (HIGH, MEDIUM, LOW) ---------- */
+    const mkOdds = async (name, extra) => (await call('POST', '/api/leads', { business_name: name, city: 'Oddsville', state: 'NY', batch: 'Odds test', ...extra })).json.lead;
+    let olead = await mkOdds('Odds Norm A', { owner_odds: 'High', owner_odds_score: '85' });
+    check('owner odds: "High" is saved as HIGH and the score as a whole number', olead.owner_odds === 'HIGH' && olead.owner_odds_score === 85, [olead.owner_odds, olead.owner_odds_score]);
+    const oddsCases = [['med', 'MEDIUM'], ['medium', 'MEDIUM'], [' low ', 'LOW'], ['HIGH', 'HIGH'], ['maybe', null], ['', null], ['very high', null], [7, null], [null, null]];
+    let okCases = true; const badCases = [];
+    for (const [input, want] of oddsCases) { const x = await mkOdds('Odds Case ' + JSON.stringify(input), { owner_odds: input }); if (x.owner_odds !== want) { okCases = false; badCases.push([input, x.owner_odds]); } }
+    check('owner odds: "med", "medium", " low ", "HIGH" are understood, anything else becomes empty', okCases, badCases);
+    let okScores = true; const badScores = [];
+    for (const [input, want] of [[0, 0], [100, 100], ['64', 64], [101, null], [-1, null], [7.5, null], ['abc', null], ['', null], [true, null]]) { const x = await mkOdds('Odds Score ' + JSON.stringify(input), { owner_odds: 'LOW', owner_odds_score: input }); if (x.owner_odds_score !== want) { okScores = false; badScores.push([input, x.owner_odds_score]); } }
+    check('owner odds score: only a whole number from 0 to 100 is kept, anything else becomes empty', okScores, badScores);
+    r = await call('PATCH', '/api/leads/' + olead.id, { owner_odds: 'low' });
+    check('owner odds can be changed on an existing lead (score kept)', r.json.lead.owner_odds === 'LOW' && r.json.lead.owner_odds_score === 85, r.json.lead);
+    r = await call('PATCH', '/api/leads/' + olead.id, { notes: 'just a note' });
+    check('saving other fields does not wipe the odds', r.json.lead.owner_odds === 'LOW' && r.json.lead.owner_odds_score === 85, r.json.lead);
+    r = await call('PATCH', '/api/leads/' + olead.id, { owner_odds: '' });
+    check('clearing the odds clears the score with it', r.json.lead.owner_odds === null && r.json.lead.owner_odds_score === null, r.json.lead);
+    r = await call('POST', '/api/leads/check', { business_name: 'Whatever', owner_odds: 'HIGH' });
+    check('the duplicate check accepts the new field', r.status === 200, r.status);
+
+    /* import with the two new columns */
+    const oddsRows = [
+      { business_name: 'Odds Imp High', phone: '(555) 310-0001', city: 'Importville', state: 'PA', owner_odds: 'HIGH', owner_odds_score: '90' },
+      { business_name: 'Odds Imp Mid', phone: '(555) 310-0002', city: 'Importville', state: 'PA', owner_odds: 'medium', owner_odds_score: 55 },
+      { business_name: 'Odds Imp Low', phone: '(555) 310-0003', city: 'Importville', state: 'PA', owner_odds: 'Low', owner_odds_score: '12' },
+      { business_name: 'Odds Imp Junk', phone: '(555) 310-0004', city: 'Importville', state: 'PA', owner_odds: 'unknown', owner_odds_score: '250' },
+      { business_name: 'Odds Imp None', phone: '(555) 310-0005', city: 'Importville', state: 'PA' },
+    ];
+    r = await call('POST', '/api/import/preview', { rows: oddsRows, defaults: { source: 'google_maps', batch: 'Odds import' } });
+    check('import preview shows the odds it understood and nothing for junk', r.json.counts.new === 5 && r.json.rows[0].lead.owner_odds === 'HIGH' && r.json.rows[0].lead.owner_odds_score === 90 && r.json.rows[1].lead.owner_odds === 'MEDIUM' && r.json.rows[3].lead.owner_odds === null && r.json.rows[3].lead.owner_odds_score === null, r.json.rows && r.json.rows.map((x) => [x.lead.owner_odds, x.lead.owner_odds_score]));
+    r = await call('POST', '/api/import/commit', { rows: oddsRows, defaults: { source: 'google_maps', batch: 'Odds import' }, mode: 'skip' });
+    check('import with the odds columns adds every orow', r.json.added === 5, r.json);
+    const ODDS_BATCH = '&batch=' + encodeURIComponent('Odds import');
+    let oimp = (await call('GET', '/api/leads?sort=odds' + ODDS_BATCH)).json.rows;
+    check('imported odds and scores are stored', oimp.map((x) => x.business_name + ':' + x.owner_odds + ':' + x.owner_odds_score).join('|') === 'Odds Imp High:HIGH:90|Odds Imp Mid:MEDIUM:55|Odds Imp Low:LOW:12|Odds Imp None:null:null|Odds Imp Junk:null:null', oimp.map((x) => [x.business_name, x.owner_odds, x.owner_odds_score]));
+    /* update mode only fills what is empty */
+    const upRows = [
+      { business_name: 'Odds Imp High', phone: '(555) 310-0001', city: 'Importville', state: 'PA', owner_odds: 'LOW', owner_odds_score: '5' },
+      { business_name: 'Odds Imp Junk', phone: '(555) 310-0004', city: 'Importville', state: 'PA', owner_odds: 'MEDIUM', owner_odds_score: '48' },
+      { business_name: 'Odds Imp None', phone: '(555) 310-0005', city: 'Importville', state: 'PA', owner_odds: 'HIGH' },
+    ];
+    r = await call('POST', '/api/import/commit', { rows: upRows, defaults: { source: 'google_maps', batch: 'Odds import' }, mode: 'update' });
+    check('update mode: two leads gained odds, the one that already had odds was left alone', r.json.updated === 2 && r.json.skipped_duplicates === 1, r.json);
+    oimp = (await call('GET', '/api/leads?sort=odds' + ODDS_BATCH)).json.rows;
+    const oby = Object.fromEntries(oimp.map((x) => [x.business_name, x]));
+    check('update mode never overwrites existing odds or score', oby['Odds Imp High'].owner_odds === 'HIGH' && oby['Odds Imp High'].owner_odds_score === 90, oby['Odds Imp High']);
+    check('update mode fills empty odds together with their score', oby['Odds Imp Junk'].owner_odds === 'MEDIUM' && oby['Odds Imp Junk'].owner_odds_score === 48 && oby['Odds Imp None'].owner_odds === 'HIGH' && oby['Odds Imp None'].owner_odds_score === null, [oby['Odds Imp Junk'].owner_odds, oby['Odds Imp Junk'].owner_odds_score, oby['Odds Imp None'].owner_odds]);
+    r = await call('POST', '/api/import/commit', { rows: [{ business_name: 'Odds Imp Mid', phone: '(555) 310-0002', city: 'Importville', state: 'PA', owner_odds: 'MEDIUM', owner_odds_score: '77' }, { business_name: 'Odds Imp Low', phone: '(555) 310-0003', city: 'Importville', state: 'PA', owner_odds: 'HIGH', owner_odds_score: '77' }], defaults: {}, mode: 'update' });
+    check('update mode: a score alone fills in only when it belongs to the same odds (here it did not, so nothing changed)', r.json.updated === 0 && r.json.skipped_duplicates === 2, r.json);
+
+    /* filter and sort */
+    const oddsIds = Object.fromEntries(oimp.map((x) => [x.business_name, x.id]));
+    r = await call('GET', '/api/leads?owner_odds=HIGH' + ODDS_BATCH);
+    check('filter owner_odds=HIGH', r.json.total === 2 && r.json.rows.every((x) => x.owner_odds === 'HIGH'), r.json.total);
+    r = await call('GET', '/api/leads?owner_odds=low' + ODDS_BATCH);
+    check('filter accepts lower case (owner_odds=low)', r.json.total === 1 && r.json.rows[0].business_name === 'Odds Imp Low', r.json.total);
+    r = await call('GET', '/api/leads?owner_odds=none' + ODDS_BATCH);
+    check('filter owner_odds=none lists only leads with no odds', r.json.total === 0 && (await call('GET', '/api/leads?owner_odds=none&limit=1')).json.total > 5, r.json.total);
+    r = await call('GET', '/api/leads?owner_odds=bogus' + ODDS_BATCH);
+    check('an unknown odds value in the filter is ignored, not an error', r.status === 200 && r.json.total === 5, r.status);
+    // a mixed batch for the sort
+    for (const [n, o, s] of [['Sort Low 99', 'LOW', 99], ['Sort None', null, null], ['Sort Med 70', 'MEDIUM', 70], ['Sort High 60', 'HIGH', 60], ['Sort High none', 'HIGH', null], ['Sort High 90', 'HIGH', 90]]) await mkOdds(n, { batch: 'Odds sort', owner_odds: o, owner_odds_score: s });
+    const sortedNames = async (extra) => (await call('GET', '/api/leads?batch=' + encodeURIComponent('Odds sort') + '&sort=odds' + (extra || ''))).json.rows.map((x) => x.business_name);
+    const wantSort = ['Sort High 90', 'Sort High 60', 'Sort High none', 'Sort Med 70', 'Sort Low 99', 'Sort None'];
+    check('sort=odds: HIGH first, then MEDIUM, LOW, none; best score first inside each; no score last', JSON.stringify(await sortedNames()) === JSON.stringify(wantSort), await sortedNames());
+    const p1 = await sortedNames('&limit=2&offset=0'), p2 = await sortedNames('&limit=2&offset=2'), p3 = await sortedNames('&limit=2&offset=4');
+    check('sort=odds keeps pagination working (pages join up with no repeats)', JSON.stringify([...p1, ...p2, ...p3]) === JSON.stringify(wantSort), [p1, p2, p3]);
+    r = await call('GET', '/api/leads?batch=' + encodeURIComponent('Odds sort') + '&sort=odds&owner_odds=HIGH&limit=2');
+    check('filter and sort work together, total counts the whole filter', r.json.total === 3 && r.json.rows.length === 2 && r.json.rows[0].business_name === 'Sort High 90', r.json.total);
+
+    /* calls queue order: same leads, same counts, only the order changes */
+    const NOWQ = '2026-11-24T14:00:00Z';
+    const qNames = (t) => t.queue.ready.filter((x) => x.business_name.startsWith('Qodds ')).map((x) => x.business_name);
+    let qn = 0;
+    for (const [n, o, s] of [['Qodds 1 none', null, null], ['Qodds 2 low', 'LOW', 60], ['Qodds 3 high 40', 'HIGH', 40], ['Qodds 4 med', 'MEDIUM', 80], ['Qodds 5 high 90', 'HIGH', 90]]) {
+      qn++;
+      await call('POST', '/api/leads', { business_name: n, phone: '(555) 320-' + String(1000 + qn), city: 'Queueville', state: 'NY', owner_odds: o, owner_odds_score: s });
+    }
+    const tqo = (await call('GET', '/api/calls?ready_limit=400&now=' + encodeURIComponent(NOWQ))).json;
+    check('calls queue: HIGH first, then MEDIUM, then LOW, then no odds, and the old order (by id) inside each', JSON.stringify(qNames(tqo)) === JSON.stringify(['Qodds 3 high 40', 'Qodds 5 high 90', 'Qodds 4 med', 'Qodds 2 low', 'Qodds 1 none']), qNames(tqo));
+    const rk = (o) => (o === 'HIGH' ? 0 : o === 'MEDIUM' ? 1 : o === 'LOW' ? 2 : 3);
+    check('calls queue: the whole ready list is in odds order', tqo.queue.ready.every((x, i, a) => i === 0 || rk(a[i - 1].owner_odds) <= rk(x.owner_odds)) && tqo.queue.ready[0].owner_odds === 'HIGH', tqo.queue.ready.map((x) => x.owner_odds));
+    const obefore = { ready: tqo.queue.ready_total, later: tqo.queue.later_total, no_tz: tqo.queue.no_tz_total };
+    await db.run('UPDATE leads SET owner_odds = NULL, owner_odds_score = NULL');
+    const tqn = (await call('GET', '/api/calls?ready_limit=400&now=' + encodeURIComponent(NOWQ))).json;
+    check('calls queue: odds change only the order, never who is in it or the counts', tqn.queue.ready_total === obefore.ready && tqn.queue.later_total === obefore.later && tqn.queue.no_tz_total === obefore.no_tz && tqn.queue.ready.map((x) => x.id).sort((a, b) => a - b).join() === tqo.queue.ready.map((x) => x.id).sort((a, b) => a - b).join(), [obefore, tqn.queue.ready_total]);
+    check('calls queue: with no odds anywhere the order is the original one (least time left, then id)', tqn.queue.ready.every((x, i, a) => i === 0 || a[i - 1].window.minsLeft < x.window.minsLeft || (a[i - 1].window.minsLeft === x.window.minsLeft && a[i - 1].id < x.id)), 1);
+    check('queue and follow-up rows carry the odds fields', 'owner_odds' in tqn.queue.ready[0] && 'owner_odds_score' in tqn.queue.ready[0] && 'owner_odds' in (await call('GET', '/api/followups?limit=1')).json.rows[0], 1);
+    // put some odds back for the export and migration checks
+    await call('PATCH', '/api/leads/' + oddsIds['Odds Imp High'], { owner_odds: 'HIGH', owner_odds_score: 90 });
+    await call('PATCH', '/api/leads/' + oddsIds['Odds Imp Mid'], { owner_odds: 'MEDIUM', owner_odds_score: 55 });
+    const todayOdds = (await call('GET', '/api/today')).json.progress.today;
+    const fuOdds = (await call('PATCH', '/api/leads/' + oddsIds['Odds Imp Low'], { owner_odds: 'LOW', owner_odds_score: 12, next_followup: todayOdds })).json.lead;
+    const fuList = (await call('GET', '/api/followups?limit=300')).json.rows.find((x) => x.id === fuOdds.id);
+    check('follow-ups show the owner odds of each lead', fuList && fuList.owner_odds === 'LOW' && fuList.owner_odds_score === 12, fuList);
+    const oddsCsv = Lib.parseCSV((await call('GET', '/api/export/leads.csv')).buf.toString('utf8'));
+    const ohdr = oddsCsv[0], orow = oddsCsv.find((x) => x[1] === 'Odds Imp High');
+    check('the leads CSV export has owner_odds and owner_odds_score columns with the values', ohdr.includes('owner_odds') && ohdr.includes('owner_odds_score') && orow[ohdr.indexOf('owner_odds')] === 'HIGH' && orow[ohdr.indexOf('owner_odds_score')] === '90', [ohdr.slice(12, 16), orow && orow.slice(12, 16)]);
+    const rowNone = oddsCsv.find((x) => x[1] === 'Ridgeline Roofing');
+    check('a lead without odds exports empty cells', rowNone && rowNone[ohdr.indexOf('owner_odds')] === '' && rowNone[ohdr.indexOf('owner_odds_score')] === '', rowNone);
+
+    /* the migration: an existing production table has no odds columns; the next start must add them and touch nothing else */
+    const nBefore = (await db.get('SELECT COUNT(*) AS n FROM leads')).n;
+    const sampleSql = "SELECT id, business_name, phone, status, notes, created_at FROM leads WHERE business_name = 'Ridgeline Roofing'";
+    const sampleBefore = await db.get(sampleSql);
+    await db.exec('ALTER TABLE leads DROP COLUMN owner_odds; ALTER TABLE leads DROP COLUMN owner_odds_score;');
+    const colsOf = async () => (await db.all("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leads' AND column_name LIKE 'owner_odds%' ORDER BY column_name")).map((c) => c.column_name + ':' + c.data_type + ':' + c.is_nullable).join();
+    check('(setup) the old production shape has no odds columns', (await colsOf()) === '', await colsOf());
+    resetSchemaFlag(); await app.init();
+    check('migration: the odds columns are added to the existing table (TEXT and INTEGER, both optional)', (await colsOf()) === 'owner_odds:text:YES,owner_odds_score:integer:YES', await colsOf());
+    check('migration: existing leads are untouched and the odds start empty', (await db.get('SELECT COUNT(*) AS n FROM leads')).n === nBefore && JSON.stringify(await db.get(sampleSql)) === JSON.stringify(sampleBefore) && (await db.get('SELECT COUNT(*) AS n FROM leads WHERE owner_odds IS NOT NULL')).n === 0, 1);
+    await call('PATCH', '/api/leads/' + oddsIds['Odds Imp High'], { owner_odds: 'HIGH', owner_odds_score: 90 });
+    resetSchemaFlag(); await app.init(); resetSchemaFlag(); await app.init();
+    check('migration: running it again is harmless and keeps the data', (await colsOf()) === 'owner_odds:text:YES,owner_odds_score:integer:YES' && (await db.get('SELECT owner_odds, owner_odds_score FROM leads WHERE id = ?', oddsIds['Odds Imp High'])).owner_odds === 'HIGH', 1);
+    await db.exec('ALTER TABLE leads DROP COLUMN owner_odds_score');
+    resetSchemaFlag(); await app.init();
+    check('migration: a half-done table (only one of the two columns) is completed too', (await colsOf()) === 'owner_odds:text:YES,owner_odds_score:integer:YES', await colsOf());
+    check('migration: Row Level Security stays on for leads, with no policies', (await db.get("SELECT relrowsecurity FROM pg_class WHERE relname = 'leads' AND relkind = 'r'")).relrowsecurity === true && (await db.all("SELECT * FROM pg_policies WHERE schemaname = 'public'")).length === 0, 1);
+    await call('PATCH', '/api/leads/' + oddsIds['Odds Imp High'], { owner_odds: 'HIGH', owner_odds_score: 90 });
+
     /* ---------- export, backup ---------- */
     r = await call('GET', '/api/export/all.zip');
     const zip = readZip(r.buf);

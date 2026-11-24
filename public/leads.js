@@ -1,6 +1,6 @@
-import { h, Lib, icon, api, toast, dialog, head, loc, statusChip, relDay, ago, debounce, state, myTz, CHANNEL_ICON, tzLabel, channelChips, responsiveFold } from './ui.js';
+import { h, Lib, icon, api, toast, dialog, head, loc, statusChip, oddsChip, ODDS_CHOICES, relDay, ago, debounce, state, myTz, CHANNEL_ICON, tzLabel, channelChips, responsiveFold } from './ui.js';
 
-const FIELD_IDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes'];
+const FIELD_IDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'owner_odds'];
 
 /* Shows possible duplicates and opt-out matches. */
 export function dupBox(duplicates, optouts, onAddAnyway) {
@@ -34,16 +34,18 @@ export function openLeadForm(opts) {
     f.source = sourceSel;
     const tzSel = h('select', { class: 'input', id: 'lf-timezone' }, h('option', { value: '' }, 'Automatic from state'), ...Lib.TZ_CHOICES.map((t) => h('option', { value: t.id }, t.label)));
     f.timezone = tzSel;
+    const oddsSel = h('select', { class: 'input', id: 'lf-owner_odds' }, h('option', { value: '' }, 'Not set'), ...ODDS_CHOICES.map(([v, t]) => h('option', { value: v }, t)));
+    f.owner_odds = oddsSel;
     const trades = h('datalist', { id: 'dl-trades' }, ...['Plumber', 'Roofer', 'HVAC', 'Electrician', 'Landscaper', 'Painter', 'Pest control', 'Cleaner'].map((t) => h('option', { value: t })));
     const err = h('div', { class: 'err', role: 'alert' });
     const live = h('div');
     const submit = h('button', { class: 'btn', type: 'submit' }, editing ? 'Save changes' : 'Add lead');
     /* the less used fields sit under one fold on a phone (open when editing a lead that already has them) */
-    const hasMore = !!editing && ['email', 'website', 'trade', 'source_link', 'batch', 'timezone', 'notes'].some((k) => editing[k]);
+    const hasMore = !!editing && ['email', 'website', 'trade', 'owner_odds', 'source_link', 'batch', 'timezone', 'notes'].some((k) => editing[k]);
     const more = responsiveFold(h('details', { class: 'fold more-fields' }, h('summary', null, h('span', null, 'More details'), h('span', { class: 'muted', style: 'text-transform:none;letter-spacing:0;font-weight:400' }, 'Email, website, trade, source, notes')),
       h('div', { class: 'fold-body' },
         h('div', { class: 'grid2' }, mk('email', 'Email', { type: 'email', inputmode: 'email', autocapitalize: 'none', autocorrect: 'off', enterkeyhint: 'next' }), mk('website', 'Website', { type: 'url', inputmode: 'url', autocapitalize: 'none', autocorrect: 'off', enterkeyhint: 'next' })),
-        mk('trade', 'Trade', { list: 'dl-trades', autocapitalize: 'words', enterkeyhint: 'next' }),
+        h('div', { class: 'grid2' }, mk('trade', 'Trade', { list: 'dl-trades', autocapitalize: 'words', enterkeyhint: 'next' }), h('div', { class: 'field' }, h('label', { for: 'lf-owner_odds' }, 'Owner odds'), oddsSel)),
         h('div', { class: 'grid2' }, h('div', { class: 'field' }, h('label', { for: 'lf-source' }, 'Source *'), sourceSel), mk('source_link', 'Source link', { autocapitalize: 'none', autocorrect: 'off', enterkeyhint: 'next' })),
         h('div', { class: 'grid2' }, mk('batch', 'Batch or list name', { enterkeyhint: 'next' }), h('div', { class: 'field' }, h('label', { for: 'lf-timezone' }, 'Time zone'), tzSel)),
         mk('notes', 'Notes', { rows: 3 }, 'textarea'))), hasMore);
@@ -105,7 +107,7 @@ export function openLeadForm(opts) {
 }
 
 /* ---------------- list page ---------------- */
-const q = { q: '', status: '', trade: '', source: '', batch: '', channel: '', opted: '', sort: 'recent' };
+const q = { q: '', status: '', trade: '', source: '', batch: '', channel: '', opted: '', owner_odds: '', sort: 'recent' };
 const PAGE = 50;
 const pg = { limit: PAGE };
 
@@ -123,12 +125,12 @@ export async function renderLeads(view) {
     el.addEventListener('change', () => { q[key] = el.value; pg.limit = PAGE; paintBadge(); load(); });
     return el;
   };
-  const sort = h('select', { class: 'input', 'aria-label': 'Sort' }, ...[['recent', 'Newest first'], ['name', 'Name A to Z'], ['followup', 'Follow-up soonest'], ['touched', 'Last touched']].map(([v, l]) => h('option', { value: v }, l)));
+  const sort = h('select', { class: 'input', 'aria-label': 'Sort' }, ...[['recent', 'Newest first'], ['name', 'Name A to Z'], ['followup', 'Follow-up soonest'], ['touched', 'Last touched'], ['odds', 'Best odds first']].map(([v, l]) => h('option', { value: v }, l)));
   sort.value = q.sort;
   sort.addEventListener('change', () => { q.sort = sort.value; pg.limit = PAGE; load(); });
   search.addEventListener('input', debounce(() => { q.q = search.value; pg.limit = PAGE; load(); }, 250));
   const badge = h('span', { class: 'pill-count', hidden: true });
-  const FILTER_KEYS = ['status', 'trade', 'source', 'batch', 'channel', 'opted'];
+  const FILTER_KEYS = ['status', 'trade', 'source', 'batch', 'channel', 'opted', 'owner_odds'];
   const paintBadge = () => { const n = FILTER_KEYS.filter((k) => q[k]).length; badge.textContent = n; badge.hidden = !n; };
 
   view.append(
@@ -142,6 +144,7 @@ export async function renderLeads(view) {
           sel('source', 'All sources', Lib.SOURCES.map((s) => [s.id, s.label])),
           sel('batch', 'All batches', facets.batches.map((b) => [b, b])),
           sel('channel', 'Contacted via: any', [...Lib.CHANNELS.map((c) => [c.id, c.label]), ['none', 'Not contacted yet']]),
+          sel('owner_odds', 'Owner odds: any', [...ODDS_CHOICES, ['none', 'Not set']]),
           sel('opted', 'Opt-out: any', [['0', 'Not opted out'], ['1', 'Opted out']]), sort)), FILTER_KEYS.some((k) => q[k]))),
     h('div', { class: 'sec-head' }, h('h2', null, 'Results'), count), list);
 
@@ -152,7 +155,7 @@ export async function renderLeads(view) {
     let data;
     try { data = await api('GET', '/api/leads?' + params); } catch (e) { toast(e.message, { error: true }); return; }
     count.textContent = data.total + (data.total > data.rows.length ? ' (showing ' + data.rows.length + ')' : '');
-    list.replaceChildren(data.rows.length ? table(data.rows) : h('div', { class: 'empty' }, q.q || q.status || q.trade || q.source || q.batch || q.opted ? 'No leads match those filters.' : 'No leads yet. Add one or import a CSV.'),
+    list.replaceChildren(data.rows.length ? table(data.rows) : h('div', { class: 'empty' }, q.q || q.status || q.trade || q.source || q.batch || q.opted || q.owner_odds ? 'No leads match those filters.' : 'No leads yet. Add one or import a CSV.'),
       data.total > data.rows.length ? h('div', { style: 'padding-top:20px' }, h('button', { class: 'btn ghost', type: 'button', onclick: () => { pg.limit += PAGE; load(); } }, 'Show ' + Math.min(PAGE, data.total - data.rows.length) + ' more')) : '');
   }
   paintBadge();
@@ -164,7 +167,7 @@ function table(rows) {
   return h('div', { class: 'table-wrap' }, h('table', { class: 't cards' },
     h('thead', null, h('tr', null, ...['Business', 'Where', 'Status', 'Follow-up', 'Contacted via'].map((t) => h('th', null, t)))),
     h('tbody', null, ...rows.map((l) => h('tr', { class: 'click', tabindex: '0', onclick: (e) => { if (!e.target.closest('a')) location.hash = '#/lead/' + l.id; }, onkeydown: (e) => { if (e.key === 'Enter') location.hash = '#/lead/' + l.id; } },
-      h('td', null, h('a', { href: '#/lead/' + l.id, style: 'font-weight:600' }, l.business_name), l.opted_out ? [' ', h('span', { class: 'chip optout flat' }, 'Opted out')] : '', l.is_demo ? [' ', h('span', { class: 'chip demo' }, 'Demo')] : '',
+      h('td', null, h('a', { href: '#/lead/' + l.id, style: 'font-weight:600' }, l.business_name), l.owner_odds ? [' ', oddsChip(l)] : '', l.opted_out ? [' ', h('span', { class: 'chip optout flat' }, 'Opted out')] : '', l.is_demo ? [' ', h('span', { class: 'chip demo' }, 'Demo')] : '',
         [l.owner_name, l.trade].filter(Boolean).length ? h('div', { class: 'muted small' }, [l.owner_name, l.trade].filter(Boolean).join(' \u00b7 ')) : ''),
       h('td', { 'data-label': 'Where', class: loc(l) || l.tz ? 'where' : 'na' }, loc(l), l.tz ? h('div', { class: 'muted small' }, tzLabel(l.tz)) : ''),
       h('td', null, statusChip(l.status)),

@@ -175,6 +175,14 @@ export function ago(iso) {
   return d + (d === 1 ? ' day ago' : ' days ago');
 }
 export function statusChip(status) { return h('span', { class: 'chip s-' + status }, Lib.STATUS_LABEL[status] || status); }
+/* Owner odds: a quiet chip, a dot that fills up with the odds (empty ring = Low, half = Medium, full = High) plus the word. Not a status colour on purpose. */
+const ODDS_WORD = { HIGH: 'High', MEDIUM: 'Medium', LOW: 'Low' };
+export const ODDS_CHOICES = [['HIGH', 'High'], ['MEDIUM', 'Medium'], ['LOW', 'Low']];
+export function oddsChip(l) {
+  const o = l && l.owner_odds;
+  if (!ODDS_WORD[o]) return null;
+  return h('span', { class: 'chip odds odds-' + o.toLowerCase(), role: 'img', 'aria-label': 'Owner odds: ' + ODDS_WORD[o] }, ODDS_WORD[o] + ' odds');
+}
 export function loc(l) { return [l.city, l.state].filter(Boolean).join(', '); }
 export function ownerLine(l) { return [l.owner_name, l.trade].filter(Boolean).join(' · '); }
 export function telLink(phone) {

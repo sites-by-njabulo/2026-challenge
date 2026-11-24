@@ -1,4 +1,4 @@
-import { h, Lib, icon, api, toast, loc } from './ui.js';
+import { h, Lib, icon, api, toast, loc, oddsChip } from './ui.js';
 
 const FIELDS = [
   ['business_name', 'Business name', true, ['business', 'businessname', 'company', 'companyname', 'name', 'title']],
@@ -15,6 +15,8 @@ const FIELDS = [
   ['timezone', 'Time zone', false, ['timezone', 'tz']],
   ['notes', 'Notes', false, ['notes', 'note', 'comments', 'comment']],
   ['external_id', 'External ID', false, ['externalid', 'id']],
+  ['owner_odds', 'Owner odds (High, Medium, Low)', false, ['ownerodds', 'odds', 'ownerlikelihood', 'ownerchance']],
+  ['owner_odds_score', 'Owner odds score (0 to 100)', false, ['owneroddsscore', 'oddsscore', 'ownerlikelihoodscore', 'ownerscore']],
 ];
 const STATUS_TEXT = { new: 'New', dup: 'Duplicate', dup_in_file: 'Repeat in file', optout: 'Opted out', invalid: 'Invalid' };
 
@@ -116,7 +118,7 @@ export async function renderImport(view) {
       h('p', { class: 'hint' }, 'A duplicate is the same phone, the same website, or the same business name in the same city. Businesses that asked to opt out are never imported.'),
       h('div', { class: 'table-wrap', style: 'margin-top:12px' }, h('table', { class: 't wide' },
         h('thead', null, h('tr', null, ...['Row', 'Business', 'Where', 'Phone', 'Result'].map((t) => h('th', null, t)))),
-        h('tbody', null, ...shown.map((r) => h('tr', null, h('td', { class: 'mono' }, r.i + 2), h('td', null, r.lead.business_name || h('span', { class: 'muted' }, '(none)')), h('td', null, loc(r.lead)), h('td', { class: 'mono' }, r.lead.phone || ''),
+        h('tbody', null, ...shown.map((r) => h('tr', null, h('td', { class: 'mono' }, r.i + 2), h('td', null, r.lead.business_name || h('span', { class: 'muted' }, '(none)'), r.lead.owner_odds ? [' ', oddsChip(r.lead)] : ''), h('td', null, loc(r.lead)), h('td', { class: 'mono' }, r.lead.phone || ''),
           h('td', null, h('span', { class: 'chip flat ' + (r.status === 'new' ? 'ok' : r.status === 'invalid' || r.status === 'optout' ? 'optout' : 'dup') }, STATUS_TEXT[r.status]),
             r.matches && r.matches[0] ? h('div', { class: 'small muted' }, 'matches ', h('a', { href: '#/lead/' + r.matches[0].id }, r.matches[0].business_name), ' (' + r.matches[0].reasons.join(', ') + ')') : '',
             r.status === 'dup_in_file' ? h('div', { class: 'small muted' }, 'same as row ' + (r.file_dup_of + 2)) : '', r.reason ? h('div', { class: 'small muted' }, r.reason) : ''))))),

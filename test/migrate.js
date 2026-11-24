@@ -21,6 +21,8 @@ CREATE TABLE leads (id INTEGER PRIMARY KEY AUTOINCREMENT, business_name TEXT NOT
   website TEXT, website_norm TEXT, city TEXT, state TEXT, trade TEXT, source TEXT NOT NULL DEFAULT 'other', source_link TEXT, batch TEXT, timezone TEXT, notes TEXT,
   status TEXT NOT NULL DEFAULT 'new', next_followup TEXT, competitor_checked TEXT, competitor_checked_date TEXT, opted_out INTEGER NOT NULL DEFAULT 0, opt_out_date TEXT,
   opt_out_channel TEXT, external_id TEXT, is_demo INTEGER NOT NULL DEFAULT 0, name_city_key TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ALTER TABLE leads ADD COLUMN owner_odds TEXT;
+ALTER TABLE leads ADD COLUMN owner_odds_score INTEGER;
 CREATE TABLE contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE, channel TEXT NOT NULL, outcome TEXT NOT NULL,
   direction TEXT NOT NULL DEFAULT 'out', content TEXT, note TEXT, at TEXT NOT NULL, external_id TEXT, created_at TEXT NOT NULL, mailbox TEXT);
 CREATE TABLE deals (lead_id INTEGER PRIMARY KEY REFERENCES leads(id) ON DELETE CASCADE, call_at TEXT, call_result TEXT, proposal_sent_date TEXT, deposit_paid_date TEXT,
@@ -45,6 +47,7 @@ CREATE TABLE email_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, taken_at TEX
   lead.run(5, 'Alpha Roofing', '(615) 555-0101', '6155550101', 'Nashville', 'TN', 'Roofer', 'google_maps', 'follow_up', '2026-11-30', 0, 'alpharoofing|nashville', T, T);
   lead.run(9, 'Beta Plumbing', '(303) 555-0102', '3035550102', 'Denver', 'CO', 'Plumber', 'instagram', 'closed', null, 0, 'betaplumbing|denver', T, T);
   lead.run(12, 'Gamma HVAC', '(602) 555-0103', '6025550103', 'Phoenix', 'AZ', 'HVAC', 'referral', 'new', null, 1, 'gammahvac|phoenix', T, T);
+  old.prepare("UPDATE leads SET owner_odds = 'HIGH', owner_odds_score = 82 WHERE id = 5").run();
   const c = old.prepare("INSERT INTO contacts(id, lead_id, channel, outcome, direction, content, note, at, mailbox, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)");
   c.run(1, 5, 'call', 'no_answer', 'out', 'Rang out', null, '2026-11-21T14:00:00.000Z', null, T);
   c.run(2, 5, 'email', 'sent', 'out', 'First email', null, '2026-11-22T14:00:00.000Z', 'jay@example.test', T);
@@ -69,6 +72,8 @@ CREATE TABLE email_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, taken_at TEX
     check('commit copies every row of every table', res.committed && res.counts.leads === 3 && res.counts.contacts === 3 && res.counts.deals === 1 && res.counts.opt_outs === 1 && res.counts.call_day === 1 && res.counts.outreach_adj === 1 && res.counts.email_snapshots === 1, res);
     const l9 = await db.get('SELECT * FROM leads WHERE id = 9');
     check('lead numbers, status and fields are kept exactly', l9.business_name === 'Beta Plumbing' && l9.status === 'closed' && l9.source === 'instagram' && l9.phone_norm === '3035550102', l9);
+    const l5 = await db.get('SELECT owner_odds, owner_odds_score FROM leads WHERE id = 5');
+    check('owner odds and score are copied when the old file has them, and left empty when it does not', l5.owner_odds === 'HIGH' && l5.owner_odds_score === 82 && l9.owner_odds === null && l9.owner_odds_score === null, [l5, l9]);
     const ct = await db.all('SELECT * FROM contacts WHERE lead_id = 5 ORDER BY id');
     check('the timeline entries and the mailbox on emails are kept', ct.length === 2 && ct[1].mailbox === 'jay@example.test' && ct[0].at === '2026-11-21T14:00:00.000Z', ct);
     const dl = await db.get('SELECT * FROM deals WHERE lead_id = 9');

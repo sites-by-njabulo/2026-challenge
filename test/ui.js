@@ -88,7 +88,8 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
       const j = (m, u, b) => fetch(u, { method: m, headers: { 'Content-Type': 'application/json' }, body: b ? JSON.stringify(b) : undefined }).then((r) => r.json());
       const today = (await j('GET', '/api/today')).progress.today;
       for (let i = 0; i < 12; i++) {
-        const c = await j('POST', '/api/leads', { business_name: 'Bulk Follow ' + i, phone: '(555) 87' + String(i).padStart(2, '0') + '-' + String(3000 + i), city: 'Dayton', state: 'OH', source: 'instagram' });
+        const odds = [['HIGH', 91], ['MEDIUM', 58], ['LOW', 20], [null, null]][i % 4];
+        const c = await j('POST', '/api/leads', { business_name: 'Bulk Follow ' + i, phone: '(555) 87' + String(i).padStart(2, '0') + '-' + String(3000 + i), city: 'Dayton', state: 'OH', source: 'instagram', owner_odds: odds[0], owner_odds_score: odds[1] });
         await j('POST', '/api/leads/' + c.lead.id + '/contacts', { channel: i % 3 === 0 ? 'call' : 'instagram_dm', outcome: i % 3 === 0 ? 'no_answer' : 'sent', followup: today });
       }
     });
@@ -136,6 +137,7 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
       await wait('.counter-grid.four');
     } else check('tapping a channel opens the Follow-ups page already filtered to it', false, 'no DMs chip');
     check('the call queue is no longer on Today', !todayInfo.hasQueue, 1);
+    check('owner odds are not shown anywhere on Today', await page.evaluate(() => document.querySelectorAll('main .chip.odds').length === 0 && !/Owner odds/i.test(document.querySelector('main').textContent)), 1);
     const sast = await page.evaluate(() => document.querySelector('.page-head .sub').textContent);
     check('my own time (SAST) is shown on Today', /SAST/.test(sast), sast);
 
@@ -147,6 +149,9 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await shot('02b-followups');
     const fuInfo = await page.evaluate(() => ({ rows: document.querySelectorAll('.ledger .row').length, btns: [...document.querySelectorAll('.seg button')].map((b) => b.textContent.replace(/\s+/g, ' ').trim()) }));
     check('Follow-ups page lists everyone due with channel filters', fuInfo.rows >= 15 && fuInfo.btns.some((t) => /^Calls \d+/.test(t)) && fuInfo.btns.some((t) => /^DMs \d+/.test(t)) && fuInfo.btns.some((t) => /Coming up/.test(t)), fuInfo);
+    const fuOdds = await page.evaluate(() => [...document.querySelectorAll('.ledger .row .chip.odds')].map((c) => ({ label: c.getAttribute('aria-label'), role: c.getAttribute('role'), text: c.textContent, inWho: !!c.closest('.who') })));
+    check('Follow-ups: leads with odds show a small chip with the label "Owner odds: High" (or Medium, Low) and the word "odds"', fuOdds.length >= 9 && fuOdds.every((c) => /^Owner odds: (High|Medium|Low)$/.test(c.label) && c.role === 'img' && /^(High|Medium|Low) odds$/.test(c.text) && c.inWho) && new Set(fuOdds.map((c) => c.label)).size === 3, fuOdds.slice(0, 4));
+    check('Follow-ups: leads without odds show no chip', await page.evaluate(() => [...document.querySelectorAll('.ledger .row')].some((r) => !r.querySelector('.chip.odds'))), 1);
     await clickText(fuInfo.btns.find((t) => /^DMs/.test(t)), '.seg button');
     await sleep(500);
     const dmRows = await page.$$eval('.ledger .row', (r) => r.length);
@@ -169,6 +174,19 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     check('Calls: dials-today meter is at the top', callsInfo.meter === 'Dials today', callsInfo.meter);
     const rowText = await page.evaluate(() => document.querySelector('.ledger .row').textContent);
     check('queue rows show the lead\'s local time next to mine', /you /.test(rowText) && /(AM|PM)/.test(rowText), rowText);
+
+    /* owner odds in the queue: give the first three ready leads LOW, MEDIUM, HIGH (in that order) and the queue puts HIGH on top */
+    const readyIds = await page.evaluate(() => [...document.querySelectorAll('.ledger .row .who > a')].slice(0, 3).map((a) => Number(a.getAttribute('href').split('/').pop())));
+    await page.evaluate(async (ids) => {
+      const set = (id, o, s) => fetch('/api/leads/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner_odds: o, owner_odds_score: s }) });
+      await set(ids[0], 'LOW', 15); await set(ids[1], 'MEDIUM', 55); await set(ids[2], 'HIGH', 85);
+    }, readyIds);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.meter');
+    await sleep(700);
+    const qOrder = await page.evaluate(() => [...document.querySelectorAll('.ledger .row')].map((r) => ({ id: Number(r.querySelector('.who > a').getAttribute('href').split('/').pop()), odds: (r.querySelector('.chip.odds') || { getAttribute: () => null }).getAttribute('aria-label') })));
+    check('Calls queue: HIGH odds first, then MEDIUM, then LOW, then leads with no odds', qOrder.length >= 3 && qOrder[0].odds === 'Owner odds: High' && qOrder[0].id === readyIds[2] && qOrder[1].odds === 'Owner odds: Medium' && qOrder[1].id === readyIds[1] && qOrder[2].odds === 'Owner odds: Low' && qOrder[2].id === readyIds[0] && qOrder.slice(3).every((x) => x.odds === null), qOrder.slice(0, 5));
+    await shot('02c2-calls-queue-odds');
 
     /* log a call from the queue in two taps */
     const beforeCalls = await page.evaluate(() => document.querySelector('.meter .big').textContent);
@@ -244,6 +262,8 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await shot('04-add-lead-duplicate');
     const dupText = await page.$eval('.dupbox', (d) => d.textContent);
     check('typing a known phone shows the duplicate warning before saving', /Ridgeline Roofing/.test(dupText) && /same phone/.test(dupText), dupText);
+    check('the Add lead form has an Owner odds select (Not set, High, Medium, Low)', await page.evaluate(() => { const o = document.querySelector('#lf-owner_odds'); return !!o && o.tagName === 'SELECT' && [...o.options].map((x) => x.textContent).join('|') === 'Not set|High|Medium|Low' && !!document.querySelector('label[for="lf-owner_odds"]'); }), 1);
+    await page.select('#lf-owner_odds', 'MEDIUM');
     await page.select('#lf-source', 'referral');
     await page.evaluate(() => document.querySelector('dialog form').requestSubmit());
     await sleep(700);
@@ -257,6 +277,16 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await wait('.lead-grid .timeline, .lead-grid .empty');
     await sleep(300);
     await shot('05-lead-new');
+    const newOdds = await page.evaluate(() => ({ chip: (document.querySelector('.page-head .chip.odds') || { getAttribute: () => null }).getAttribute('aria-label'), sel: (document.querySelector('#owner-odds') || {}).value }));
+    check('a lead added with Owner odds Medium shows the chip and the detail select says Medium', newOdds.chip === 'Owner odds: Medium' && newOdds.sel === 'MEDIUM', newOdds);
+    await page.select('#owner-odds', 'HIGH');
+    await page.waitForFunction(() => (document.querySelector('.page-head .chip.odds') || {}).textContent === 'High odds', { timeout: 5000 });
+    check('changing Owner odds on the lead page saves at once and updates the chip', (await page.evaluate(async () => (await (await fetch(location.hash.replace('#/lead/', '/api/leads/'))).json()).lead.owner_odds)) === 'HIGH', 1);
+    await page.select('#owner-odds', '');
+    await page.waitForFunction(() => !document.querySelector('.page-head .chip.odds'), { timeout: 5000 });
+    check('and setting it back to Not set removes the chip', await page.evaluate(() => document.querySelector('#owner-odds').value === ''), 1);
+    await page.select('#owner-odds', 'MEDIUM');
+    await page.waitForFunction(() => (document.querySelector('.page-head .chip.odds') || {}).textContent === 'Medium odds', { timeout: 5000 });
     await clickText('Instagram DM', '.seg button');
     await page.evaluate(() => [...document.querySelectorAll('.outcomes button')].find((b) => b.textContent === 'Sent').click());
     await wait('.toast');
@@ -309,6 +339,24 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await page.select('select[aria-label="Contacted via: any"]', '');
     await sleep(500);
     await shot('08b-leads-contacted-via');
+    const leadsOdds = await page.evaluate(() => [...document.querySelectorAll('table.t tbody tr')].map((r) => ({ name: r.querySelector('a').textContent, label: (r.querySelector('.chip.odds') || { getAttribute: () => null }).getAttribute('aria-label') })));
+    check('Leads list: leads with odds show the chip next to the name, others show none', leadsOdds.filter((x) => x.label).length >= 9 && leadsOdds.some((x) => !x.label) && leadsOdds.every((x) => !x.label || /^Owner odds: (High|Medium|Low)$/.test(x.label)), leadsOdds.slice(0, 5));
+    check('Leads list: the Filters area has an "Owner odds: any" filter and a "Best odds first" sort', await page.evaluate(() => { const f = document.querySelector('select[aria-label="Owner odds: any"]'); const so = document.querySelector('select[aria-label="Sort"]'); return !!f && [...f.options].map((o) => o.textContent).join('|') === 'Owner odds: any|High|Medium|Low|Not set' && !!f.closest('details.filters') && [...so.options].some((o) => o.textContent === 'Best odds first'); }), 1);
+    await page.select('select[aria-label="Owner odds: any"]', 'HIGH');
+    await sleep(700);
+    const highRows = await page.evaluate(() => ({ n: document.querySelectorAll('table.t tbody tr').length, all: [...document.querySelectorAll('table.t tbody tr')].every((r) => (r.querySelector('.chip.odds') || {}).textContent === 'High odds'), badge: document.querySelector('details.filters .pill-count').textContent }));
+    check('the Owner odds filter narrows the list to High and the filter badge counts it', highRows.n >= 3 && highRows.all && highRows.badge === '1', highRows);
+    await page.select('select[aria-label="Owner odds: any"]', 'none');
+    await sleep(700);
+    check('the "Not set" odds filter lists only leads without a chip', await page.evaluate(() => { const r = [...document.querySelectorAll('table.t tbody tr')]; return r.length >= 5 && r.every((x) => !x.querySelector('.chip.odds')); }), 1);
+    await page.select('select[aria-label="Owner odds: any"]', '');
+    await page.select('select[aria-label="Sort"]', 'odds');
+    await sleep(700);
+    const sortedOdds = await page.evaluate(() => [...document.querySelectorAll('table.t tbody tr')].map((r) => ({ High: 0, Medium: 1, Low: 2 })[((r.querySelector('.chip.odds') || {}).textContent || '').split(' ')[0]] ?? 3));
+    check('"Best odds first" sorts High, then Medium, then Low, then no odds', sortedOdds.length >= 10 && sortedOdds.every((v, i, a) => i === 0 || a[i - 1] <= v) && sortedOdds[0] === 0 && sortedOdds.includes(3), sortedOdds);
+    await shot('08c-leads-odds-sorted');
+    await page.select('select[aria-label="Sort"]', 'recent');
+    await sleep(400);
     await page.type('input[type=search]', 'harbor');
     await sleep(700);
     check('search narrows the list', (await page.$$eval('table.t tbody tr', (r) => r.length)) === 1, 1);
@@ -317,11 +365,13 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await page.goto(BASE + '/#/import', { waitUntil: 'domcontentloaded' });
     await wait('#imp-file');
     const csv = path.join(DATA, 'upload.csv');
-    fs.writeFileSync(csv, 'Company,Contact Name,Phone Number,Email Address,Website,City,State,Category\r\nAlpine Gutters,Mia Ross,(970) 555-0111,mia@alpine.example,alpine.example,Aspen,Colorado,Roofer\r\n"Granite Peak HVAC, LLC",Wes,(801) 555-0188,,granitepeakhvac.example,Salt Lake City,UT,HVAC\r\nRiverbend Roofing,Tom,(406) 555-0133,,riverbend.example,Billings,MT,Roofer\r\nRiverbend Roofing,Tom,(406) 555-0133,,riverbend.example,Billings,MT,Roofer\r\n');
+    fs.writeFileSync(csv, 'Company,Contact Name,Phone Number,Email Address,Website,City,State,Category,Owner Odds,Odds Score\r\nAlpine Gutters,Mia Ross,(970) 555-0111,mia@alpine.example,alpine.example,Aspen,Colorado,Roofer,High,88\r\n"Granite Peak HVAC, LLC",Wes,(801) 555-0188,,granitepeakhvac.example,Salt Lake City,UT,HVAC,Low,10\r\nRiverbend Roofing,Tom,(406) 555-0133,,riverbend.example,Billings,MT,Roofer,medium,52\r\nRiverbend Roofing,Tom,(406) 555-0133,,riverbend.example,Billings,MT,Roofer,medium,52\r\n');
     await (await page.$('#imp-file')).uploadFile(csv);
     await wait('#map-business_name');
     const mapped = await page.evaluate(() => ({ biz: document.querySelector('#map-business_name').selectedOptions[0].textContent, phone: document.querySelector('#map-phone').selectedOptions[0].textContent, trade: document.querySelector('#map-trade').selectedOptions[0].textContent, state: document.querySelector('#map-state').selectedOptions[0].textContent }));
     check('column mapping is guessed from the headers', mapped.biz === 'Company' && mapped.phone === 'Phone Number' && mapped.trade === 'Category' && mapped.state === 'State', mapped);
+    const oddsMap = await page.evaluate(() => ({ odds: document.querySelector('#map-owner_odds').selectedOptions[0].textContent, score: document.querySelector('#map-owner_odds_score').selectedOptions[0].textContent, label: document.querySelector('label[for="map-owner_odds"]').textContent }));
+    check('import: the Owner Odds and Odds Score columns are matched by themselves', oddsMap.odds === 'Owner Odds' && oddsMap.score === 'Odds Score' && /Owner odds/.test(oddsMap.label), oddsMap);
     await shot('09-import-map');
     await page.select('#imp-src', 'google_maps');
     await clickText('Check duplicates');
@@ -329,12 +379,16 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await sleep(300);
     const tiles = await page.$$eval('.tiles .tile', (t) => t.map((x) => x.textContent));
     check('duplicate preview: 1 new Alpine, a duplicate of Granite Peak, a repeat in the file', /^1New|^2New/.test(tiles[0]) && /1Duplicates/.test(tiles[1]) && /1Repeats in file/.test(tiles[2]), tiles);
+    const prevOdds = await page.evaluate(() => [...document.querySelectorAll('table.t.wide tbody .chip.odds')].map((c) => c.getAttribute('aria-label')));
+    check('import preview shows the owner odds chip on each row that has them', prevOdds.length >= 2 && prevOdds.includes('Owner odds: High') && prevOdds.includes('Owner odds: Medium'), prevOdds);
     await shot('10-import-preview');
     await clickText('Import 2 leads');
     await wait('h2');
     await page.waitForFunction(() => /Import finished/.test(document.body.textContent), { timeout: 5000 });
     const done = await page.$eval('.kv', (k) => k.textContent);
     check('import result: 2 added, the duplicates skipped', /Added2/.test(done) && /Skipped \(duplicates\)2/.test(done), done);
+    const impOdds = await page.evaluate(async () => (await (await fetch('/api/leads?q=' + encodeURIComponent('Alpine Gutters'))).json()).rows.map((r) => [r.owner_odds, r.owner_odds_score]).concat((await (await fetch('/api/leads?q=Riverbend')).json()).rows.map((r) => [r.owner_odds, r.owner_odds_score])));
+    check('the imported leads kept their odds and scores', JSON.stringify(impOdds) === JSON.stringify([['HIGH', 88], ['MEDIUM', 52]]), impOdds);
 
     /* ---------- pipeline, stats, settings ---------- */
     for (const [hash, sel, nm] of [['#/pipeline', '.board', '11-pipeline'], ['#/stats', '.tiles', '12-stats'], ['#/settings', '#s-script', '13-settings']]) {
@@ -354,6 +408,7 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await page.goto(BASE + '/#/leads');
     await wait('table.t');
     const leadHref = await page.$eval('table.t tbody a', (a) => a.getAttribute('href'));
+    await page.evaluate(async (h) => { await fetch('/api/leads/' + h.split('/').pop(), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner_odds: 'HIGH', owner_odds_score: 93 }) }); }, leadHref);
     await page.goto(BASE + '/' + leadHref);
     await wait('.lead-grid');
     await sleep(300);
@@ -466,10 +521,12 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
         return r.height < 43.5 || r.width < 43.5;
       }).map(nm);
       const smallInput = ctl.filter((e) => /^(INPUT|SELECT|TEXTAREA)$/.test(e.tagName) && !['checkbox', 'radio', 'file'].includes(e.type) && parseFloat(getComputedStyle(e).fontSize) < 16).map(nm);
-      return { overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth, small, smallInput };
+      const chips = [...document.querySelectorAll('main .chip.odds')]; const chipBad = chips.filter((c) => { const r = c.getBoundingClientRect(); return r.right > document.documentElement.clientWidth || r.width < 20 || !/^Owner odds: (High|Medium|Low)$/.test(c.getAttribute('aria-label') || ''); }).length;
+      return { overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth, small, smallInput, chips: chips.length, chipBad };
     };
     const PHONE_PAGES = [['#/today', '.counter-grid.four', 'today'], ['#/calls', '.meter', 'calls'], ['#/email', '.tiles', 'email'], ['#/followups', '.seg', 'followups'], ['#/leads', 'table.t', 'leads'], [leadHref.slice(leadHref.indexOf('#')), '.lead-grid', 'lead'], ['#/pipeline', '.board', 'pipeline'], ['#/stats', '.tiles', 'stats'], ['#/settings', '#s-script', 'settings'], ['#/import', '#imp-file', 'import']];
-    const problems = { overflow: {}, small: {}, smallInput: {} };
+    const problems = { overflow: {}, small: {}, smallInput: {}, noChip: {}, chipBad: {} };
+    const NEEDS_CHIP = ['followups', 'leads', 'lead'];
     for (const [w, hgt] of [[390, 844], [360, 740]]) {
       await page.setViewport({ width: w, height: hgt, isMobile: true, hasTouch: true, deviceScaleFactor: w === 390 ? 2 : 3 });
       for (const [hash, sel, nm] of PHONE_PAGES) {
@@ -486,6 +543,8 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
             if (p.overflow > 1) problems.overflow[key] = p.overflow;
             if (p.small.length) problems.small[key] = p.small.slice(0, 4);
             if (p.smallInput.length) problems.smallInput[key] = p.smallInput.slice(0, 4);
+            if (p.chipBad) problems.chipBad[key] = p.chipBad;
+            if (tab === 'Call queue' && !p.chips) problems.noChip[key] = 0;
             if (w === 390) await shot('20b-calls-' + tab.toLowerCase().replace(' ', '-') + '-phone');
           }
           continue;
@@ -495,10 +554,13 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
         if (p.overflow > 1) problems.overflow[key] = p.overflow;
         if (p.small.length) problems.small[key] = p.small.slice(0, 4);
         if (p.smallInput.length) problems.smallInput[key] = p.smallInput.slice(0, 4);
+        if (p.chipBad) problems.chipBad[key] = p.chipBad;
+        if (NEEDS_CHIP.includes(nm) && !p.chips) problems.noChip[key] = 0;
         if (w === 390) await shot('2x-' + nm + '-phone');
       }
     }
     check('no page scrolls sideways on a phone (360 and 390 wide, every page, all three Calls tabs)', Object.keys(problems.overflow).length === 0, problems.overflow);
+    check('on a phone the owner odds chip is on screen and fits the width on Leads, Follow-ups, the lead page and the Call queue, with its "Owner odds: ..." label', Object.keys(problems.noChip).length === 0 && Object.keys(problems.chipBad).length === 0, [problems.noChip, problems.chipBad]);
     check('every button, link, select and field on a phone is at least 44 px tall', Object.keys(problems.small).length === 0, problems.small);
     check('every input, select and text box is 16px or larger, so iOS does not zoom in', Object.keys(problems.smallInput).length === 0, problems.smallInput);
     await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
@@ -513,7 +575,7 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     check('on a phone the Leads filters start closed behind one "Filters and sort" button', fl.open === false && /^Filters and sort/.test(fl.summary), fl);
     await page.evaluate(() => document.querySelector('details.filters > summary').click());
     await sleep(200);
-    check('tapping it opens the filters, and they fit the screen', await page.evaluate(() => { const d = document.querySelector('details.filters'); const r = [...d.querySelectorAll('select')].map((e) => e.getBoundingClientRect()); return d.open && r.length === 7 && r.every((b) => b.right <= document.documentElement.clientWidth && b.height >= 44); }), 1);
+    check('tapping it opens the filters, and they fit the screen', await page.evaluate(() => { const d = document.querySelector('details.filters'); const r = [...d.querySelectorAll('select')].map((e) => e.getBoundingClientRect()); return d.open && r.length === 8 && r.every((b) => b.right <= document.documentElement.clientWidth && b.height >= 44); }), 1);
     await page.select('select[aria-label="All statuses"]', 'new');
     await sleep(500);
     check('an active filter shows a count on the closed button and survives a visit to a lead and back', await page.evaluate(() => document.querySelector('details.filters .pill-count').textContent === '1' && !document.querySelector('details.filters .pill-count').hidden), 1);
@@ -553,6 +615,10 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     check('the dialog close button is at least 44 px', dl.closeSize >= 44, dl.closeSize);
     const moreClosed = await page.evaluate(() => { const d = document.querySelector('dialog[open] details.more-fields'); return !!d && !d.open; });
     check('the rarely used fields in Add lead are tucked under "More details" on a phone', moreClosed, 1);
+    await page.evaluate(() => { document.querySelector('dialog[open] details.more-fields').open = true; });
+    await sleep(200);
+    const oddsField = await page.evaluate(() => { const o = document.querySelector('#lf-owner_odds'); const r = o.getBoundingClientRect(); return { h: r.height, fs: parseFloat(getComputedStyle(o).fontSize), right: r.right, vw: document.documentElement.clientWidth }; });
+    check('on a 360 px phone the Owner odds select in Add lead is at least 44 px tall, 16 px text and fits the screen', oddsField.h >= 43.5 && oddsField.fs >= 16 && oddsField.right <= oddsField.vw, oddsField);
     await page.keyboard.press('Escape');
     await sleep(300);
     await page.goto(BASE + '/' + leadHref.slice(leadHref.indexOf('#')));

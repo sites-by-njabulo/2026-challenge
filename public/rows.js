@@ -1,5 +1,5 @@
 /* Row builders shared by Today, Follow-ups and Calls. */
-import { h, Lib, icon, loc, statusChip, relDay, ago, telLink, windowMarker, timesLine, fmtDay, CHANNEL_ICON } from './ui.js';
+import { h, Lib, icon, loc, statusChip, oddsChip, relDay, ago, telLink, windowMarker, timesLine, fmtDay, CHANNEL_ICON } from './ui.js';
 import { logPanel } from './log.js';
 
 /* Inline "Log" panel that opens under a row. ctx.open is a Set of lead ids with the panel open; ctx.onLogged runs after saving. */
@@ -24,7 +24,7 @@ export function followupRow(l, ctx) {
   const li = h('li', { class: 'row nolamp fu' + (l.overdue ? ' overdue' : '') });
   const last = l.last_at ? 'Last: ' + Lib.CHANNEL_LABEL[l.last_channel] + ', ' + Lib.OUTCOME_LABEL[l.last_outcome] + ' · ' + ago(l.last_at) : 'Not contacted yet';
   li.append(
-    h('div', { class: 'who' }, h('a', { href: '#/lead/' + l.id }, l.business_name), ' ', statusChip(l.status),
+    h('div', { class: 'who' }, h('a', { href: '#/lead/' + l.id }, l.business_name), ' ', statusChip(l.status), ' ', oddsChip(l),
       h('div', { class: 'meta' }, [l.owner_name, loc(l)].filter(Boolean).join(' · ')),
       h('div', { class: 'meta' }, l.last_at ? [icon(CHANNEL_ICON[l.last_channel], 14), ' ' + last] : last)),
     h('div', { class: 'when' }, h('div', { class: 'due' }, relDay(l.next_followup, ctx.today))),
@@ -42,7 +42,7 @@ export function queueRow(l, now, win, ctx) {
     : h('span', { class: 'btn sm', 'aria-disabled': 'true', title: w.ok ? 'No phone number' : 'Outside calling hours' }, icon('phone', 16), 'Call');
   li.append(
     h('span', { class: 'lamp ' + (w.ok ? 'on' : w.unknown ? 'warn' : '') }),
-    h('div', { class: 'who' }, h('a', { href: '#/lead/' + l.id }, l.business_name),
+    h('div', { class: 'who' }, h('a', { href: '#/lead/' + l.id }, l.business_name), l.owner_odds ? ' ' : '', oddsChip(l),
       h('div', { class: 'meta' }, [l.owner_name, l.trade, loc(l)].filter(Boolean).join(' · ')),
       h('div', { class: 'meta' }, telLink(l.phone), l.competitor_checked_date ? ' · competitor checked ' + fmtDay(l.competitor_checked_date) : h('span', { class: 'err', style: 'font-weight:400' }, ' · no competitor check yet'))),
     h('div', { class: 'when' }, windowMarker(w), h('div', null, timesLine(l.tz, now, w))),

@@ -1,4 +1,4 @@
-import { h, Lib, icon, api, toast, dialog, head, confirmDialog, loc, statusChip, relDay, fmtDateTime, fmtDay, money, myTz, telLink, windowMarker, timesLine, tzLabel, state, CHANNEL_ICON, channelChips } from './ui.js';
+import { h, Lib, icon, api, toast, dialog, head, confirmDialog, loc, statusChip, oddsChip, ODDS_CHOICES, relDay, fmtDateTime, fmtDay, money, myTz, telLink, windowMarker, timesLine, tzLabel, state, CHANNEL_ICON, channelChips } from './ui.js';
 import { logPanel } from './log.js';
 import { openLeadForm } from './leads.js';
 
@@ -37,7 +37,7 @@ export async function renderLead(view, id) {
     const header = h('div', { class: 'page-head' },
       h('div', null, h('a', { href: '#/leads', class: 'small muted linkbtn' }, 'All leads'), h('h1', { style: 'margin-top:6px' }, l.business_name),
         h('p', { class: 'sub' }, [l.owner_name, l.trade, loc(l)].filter(Boolean).join(' · ') || 'No details yet'),
-        h('div', { class: 'actions', style: 'margin-top:10px' }, statusChip(l.status), l.opted_out ? h('span', { class: 'chip optout flat' }, 'Opted out') : null, l.is_demo ? h('span', { class: 'chip demo' }, 'Demo lead') : null),
+        h('div', { class: 'actions', style: 'margin-top:10px' }, statusChip(l.status), oddsChip(l), l.opted_out ? h('span', { class: 'chip optout flat' }, 'Opted out') : null, l.is_demo ? h('span', { class: 'chip demo' }, 'Demo lead') : null),
         h('div', { class: 'actions', style: 'margin-top:10px' }, h('span', { class: 'muted small' }, 'Contacted via'), channelChips(viaList())),
         w && !l.opted_out ? h('div', { style: 'margin-top:10px' }, windowMarker(w)) : null),
       h('div', { class: 'actions' },
@@ -77,9 +77,13 @@ export async function renderLead(view, id) {
       events.length > shown.length ? h('button', { class: 'btn ghost', type: 'button', onclick: () => { showAll = true; draw(); } }, 'Show ' + (events.length - shown.length) + ' older') : null));
 
     /* right column */
+    const oddsSel = h('select', { class: 'input', style: 'width:auto', id: 'owner-odds', 'aria-label': 'Owner odds' }, h('option', { value: '' }, 'Not set'), ...ODDS_CHOICES.map(([v, t]) => h('option', { value: v }, t)));
+    oddsSel.value = l.owner_odds || '';
+    oddsSel.addEventListener('change', () => patch({ owner_odds: oddsSel.value || null }, 'Owner odds saved'));
     const info = h('section', { class: 's-info' }, h('div', { class: 'sec-head' }, h('h2', null, 'Contact')),
       h('dl', { class: 'kv', style: 'padding-top:14px' },
         h('dt', null, 'Phone'), h('dd', null, telLink(l.phone)),
+        h('dt', null, 'Owner odds'), h('dd', null, oddsSel, l.owner_odds && l.owner_odds_score != null ? h('div', { class: 'muted small', style: 'padding-top:4px' }, 'Score ' + l.owner_odds_score + ' of 100') : null),
         h('dt', null, 'Email'), h('dd', null, l.email ? h('a', { href: 'mailto:' + l.email }, l.email) : h('span', { class: 'muted' }, 'None')),
         h('dt', null, 'Website'), h('dd', null, l.website ? h('a', { href: /^https?:/.test(l.website) ? l.website : 'https://' + l.website, target: '_blank', rel: 'noopener' }, l.website) : h('span', { class: 'muted' }, 'None')),
         h('dt', null, 'Source'), h('dd', null, Lib.SOURCE_LABEL[l.source] || l.source, l.source_link ? [' · ', h('a', { href: /^https?:/.test(l.source_link) ? l.source_link : 'https://' + l.source_link, target: '_blank', rel: 'noopener' }, 'link')] : ''),
