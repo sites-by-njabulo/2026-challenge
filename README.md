@@ -1,43 +1,70 @@
-# Lead Tracker
+# Lead Tracker (cloud version)
 
 One record per business, every contact attempt on its timeline. A business you called, DMed and emailed is one lead, not three.
 
-## Run it
+This is the same app as the local Lead Tracker, ported to run on **Vercel** (serverless) with a **Supabase** Postgres database, so it opens from a phone.
+To put it online, follow [DEPLOY.md](DEPLOY.md). The local tracker in the `Lead Tracker` folder is untouched and still works.
 
-1. Double-click `start.cmd` (or run `node --no-warnings server.js` in this folder). Needs Node 22.13 or newer. Nothing to install.
-2. Open http://127.0.0.1:4310
-3. First visit: choose a password (8 or more characters). Leads stay on this computer in `data/tracker.db`.
+## How it is built
 
-Optional, to use it on your phone on the same Wi-Fi: `set HOST=0.0.0.0` before `start.cmd`, then open `http://<this PC's IP>:4310`. That connection is not encrypted, so only do it on a network you trust.
+- `public/` the screens (plain HTML, CSS and ES modules, no build step). Vercel serves this folder as static files. Same screens as the local app.
+- `api/index.js` the one serverless function. `vercel.json` sends every `/api/*` request to it, with a 60 second limit.
+- `src/app.js` the whole API (routes, rules, import, export, Zapmail sync, login). One `(req, res)` handler.
+- `src/db.js` the only door to the database: `pg` over `DATABASE_URL` in production (one connection per instance, no named prepared statements, so it works with the Supabase pooler in transaction mode on port 6543).
+- `src/schema.js` creates the tables on first connection, turns on Row Level Security on every table with no policies, and checks again on every cold start.
+- `dev-server.js` serves `public/` and the same handler on your own computer. Not used on Vercel.
+- `seed.js` demo data. `scripts/` Google Maps import, Zapmail snapshot file import, and `migrate-from-local.js` (copies the old local tracker into the cloud one).
+- `test/` three test suites, see below.
 
-Demo data: `node --no-warnings seed.js` adds 10 fake leads tagged Demo. Remove them in Settings, Demo data, before you start with real leads.
+## Settings (environment variables)
 
-## Stack
+| Name | Needed | What it does |
+|---|---|---|
+| `DATABASE_URL` | yes | Supabase Transaction pooler string (port 6543), password filled in and URL-encoded. `DATABASE_SSL=off` turns TLS off (only for a local Postgres). |
+| `APP_SECRET` | yes, 16+ characters | Encrypts the saved Zapmail key (AES-256-GCM, key made from it with scrypt). Changing it means pasting the Zapmail key again. |
+| `SETUP_TOKEN` | yes, 8+ characters | The first-run "set a password" step refuses without it. Once a password exists, setup is closed. |
+| `CRON_SECRET` | yes, 16+ characters | The daily Vercel cron calls `GET /api/cron/zapmail` with `Authorization: Bearer <CRON_SECRET>`. Vercel sends it by itself when this variable exists. |
+| `TEST_PGLITE=1` | tests only | With no `DATABASE_URL`, use a throwaway in-process Postgres (PGlite). Without `DATABASE_URL` and without this, the app refuses to start. |
 
-Node's built-in SQLite database, a small web server with no packages, plain HTML, CSS and JavaScript. Login is a password you set (stored hashed), kept in a cookie. Fonts (IBM Plex) load from Google Fonts and fall back to system fonts offline.
+## What changed from the local version
 
-## What is where
+- Everything is async and talks to Postgres. Times and dates are still stored as text exactly as before, so every counting rule is unchanged.
+- No files on disk. Sessions, the password hash, settings and the encrypted Zapmail key are table rows. `data/.secret` became `APP_SECRET`.
+- **First-run security:** setting the first password needs `SETUP_TOKEN`. Login lockout (6 wrong tries, 10 minutes) now lives in a table, so it holds across serverless instances. The CSRF origin check stays. The session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` on https.
+- **Zapmail refresh:** a timer cannot run on serverless. It refreshes when the Email page opens (if older than 5 minutes), every 5 minutes while the page is open, on the Refresh button, and once a day from a Vercel cron (Hobby plan allows one a day). The 3-hourly refresh is gone.
+- **Backups:** the local `VACUUM INTO` backups are gone (Settings, Backups now explains this honestly). Supabase keeps its own backups, and Export (zip or CSV) still works as your own copy.
+- Import and duplicate checks do their database lookups in bulk (a few queries for a whole file, not a few per row), because the database is a network away.
+- Request bodies are limited to about 4.4 MB (Vercel allows 4.5 MB). That is roughly 10,000 simple lead rows per import file.
+- The old Windows autostart scripts and `start.cmd` were dropped. They only made sense for a long-running local process.
 
-- `server.js` the API, database, import, export, backups, login
-- `public/` the screens: Today, Leads, lead page, Pipeline, Stats, Settings, CSV import
-- `public/lib.js` shared rules: time zones and the 8 AM to 9 PM window, duplicate keys, CSV
-- `data/` your database and backups (not for git)
-- `test/flow.js` end to end API test, `test/ui.js` browser test with screenshots
-- `seed.js` demo data
+## Run it on your computer
 
-## Rules built in
+```
+npm install
+set TEST_PGLITE=1        (PowerShell: $env:TEST_PGLITE = "1")
+npm start                 then open http://127.0.0.1:4310
+```
 
-- No automated sending of anything. You log DMs and emails by hand. Calls are manual (a Call button opens your phone app, it does not dial by itself).
+`TEST_PGLITE=1` is a throwaway database in memory. To try it against Supabase instead, set `DATABASE_URL`, `APP_SECRET` and `SETUP_TOKEN` and leave `TEST_PGLITE` out.
+
+## Tests
+
+You cannot reach Supabase from the tests, so they run against PGlite (real Postgres compiled to WebAssembly).
+
+```
+npm run test:all     everything below, one after the other
+npm test             API suite (test/flow.js) on PGlite
+npm run test:ui      browser suite (test/ui.js) on PGlite
+npm run test:pg      both of those again through the real `pg` package over a Postgres connection (the production path)
+npm run test:other   test/migrate.js (the copy-from-local script) and test/config.js (wrong-setup behaviour)
+```
+
+`test/ui.js` needs Microsoft Edge and `puppeteer-core` (the path is at the top of that file).
+
+## Rules built in (unchanged)
+
+- No automated sending of anything. You log DMs and emails by hand. Calls are manual.
 - No scraping. Leads come in by CSV import or by hand.
 - Opted-out leads are blocked on every channel, leave every queue and follow-up list, and cannot be contacted by logging. Removing an opt-out needs you to type REMOVE. Deleting a lead that opted out keeps the opt-out record, so a re-import of that business is still blocked.
 - Duplicates are matched on phone, website, or business name plus city, and you are warned before anything is added.
-- The call queue shows only leads inside the calling window (default 8 AM to 9 PM in their local time). Some states set tighter hours: narrow the window in Settings if you call those states.
-
-## Backups
-
-A copy of the database is made when the server starts, every 3 hours while it runs, after each import, and when you press Back up now in Settings. The newest 60 are kept in `data/backups/`. To restore, stop the server and copy a backup over `data/tracker.db`.
-
-## Left room for later (not built)
-
-- Phase 2, Instantly: email is already a channel. Every lead and every contact entry has an `external_id` field, so sends, replies and bounces can be matched to the right lead without changing the data.
-- Phase 3, content tracking: a separate table (what you posted, where, views, which posts brought leads) can be added next to the leads table.
+- The call queue shows only leads inside the calling window (default 8 AM to 9 PM in their local time).

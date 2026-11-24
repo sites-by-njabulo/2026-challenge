@@ -129,7 +129,7 @@ export async function renderImport(view) {
       h('h2', null, 'Import finished'),
       h('dl', { class: 'kv' }, h('dt', null, 'Added'), h('dd', null, r.added), h('dt', null, 'Updated'), h('dd', null, r.updated), h('dt', null, 'Skipped (duplicates)'), h('dd', null, r.skipped_duplicates),
         h('dt', null, 'Blocked (opt-out)'), h('dd', null, r.blocked_optout), h('dt', null, 'Invalid rows'), h('dd', null, r.invalid)),
-      h('p', { class: 'hint' }, 'A backup was saved automatically.'),
+      h('p', { class: 'hint' }, 'Your leads are saved in your database. You can download a copy any time in Settings, Export.'),
       h('div', { class: 'actions' }, h('a', { class: 'btn', href: '#/leads' }, 'See the leads'), h('button', { class: 'btn ghost', type: 'button', onclick: () => { st.rows = []; stepFile(); } }, icon('upload', 18), 'Import another file'))));
   }
 

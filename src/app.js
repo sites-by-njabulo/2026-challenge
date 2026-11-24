@@ -1,73 +1,12 @@
 'use strict';
-/* Lead Tracker server. Node built-ins only (http, node:sqlite, crypto, zlib). No npm packages. */
-const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
+/* Lead Tracker API. One request handler (req, res) that works as a Vercel serverless function and under plain node:http.
+   Database: Postgres through src/db.js. Everything that touches it is async.
+   Nothing is written to disk: sessions, the password hash, settings and the encrypted Zapmail key all live in tables. */
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const { DatabaseSync } = require('node:sqlite');
-const Lib = require('./public/lib.js');
-
-const PORT = Number(process.env.PORT) || 4310;
-const HOST = process.env.HOST || '127.0.0.1';
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const PUBLIC_DIR = path.join(__dirname, 'public');
-fs.mkdirSync(path.join(DATA_DIR, 'backups'), { recursive: true });
-
-const db = new DatabaseSync(path.join(DATA_DIR, 'tracker.db'));
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-
-/* ---------------- schema ---------------- */
-db.exec(`
-CREATE TABLE IF NOT EXISTS leads (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  business_name TEXT NOT NULL,
-  owner_name TEXT, phone TEXT, phone_norm TEXT, email TEXT, email_norm TEXT,
-  website TEXT, website_norm TEXT, city TEXT, state TEXT, trade TEXT,
-  source TEXT NOT NULL DEFAULT 'other', source_link TEXT, batch TEXT, timezone TEXT, notes TEXT,
-  status TEXT NOT NULL DEFAULT 'new', next_followup TEXT,
-  competitor_checked TEXT, competitor_checked_date TEXT,
-  opted_out INTEGER NOT NULL DEFAULT 0, opt_out_date TEXT, opt_out_channel TEXT,
-  external_id TEXT, is_demo INTEGER NOT NULL DEFAULT 0, name_city_key TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone_norm);
-CREATE INDEX IF NOT EXISTS idx_leads_site ON leads(website_norm);
-CREATE INDEX IF NOT EXISTS idx_leads_key ON leads(name_city_key);
-CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
-CREATE TABLE IF NOT EXISTS contacts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
-  channel TEXT NOT NULL, outcome TEXT NOT NULL, direction TEXT NOT NULL DEFAULT 'out',
-  content TEXT, note TEXT, at TEXT NOT NULL, external_id TEXT, created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_contacts_lead ON contacts(lead_id, at);
-CREATE INDEX IF NOT EXISTS idx_contacts_at ON contacts(at);
-CREATE TABLE IF NOT EXISTS deals (
-  lead_id INTEGER PRIMARY KEY REFERENCES leads(id) ON DELETE CASCADE,
-  call_at TEXT, call_result TEXT, proposal_sent_date TEXT, deposit_paid_date TEXT,
-  deposit_amount REAL, signed_date TEXT, deal_value REAL, updated_at TEXT
-);
-CREATE TABLE IF NOT EXISTS opt_outs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  lead_id INTEGER, business_name TEXT, phone_norm TEXT, email_norm TEXT, website_norm TEXT, name_city_key TEXT,
-  at TEXT NOT NULL, channel TEXT NOT NULL, note TEXT, removed_at TEXT, removed_note TEXT
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash TEXT PRIMARY KEY, created_at TEXT NOT NULL, expires_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS call_tally (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, dials INTEGER NOT NULL DEFAULT 0,
-  conversations INTEGER NOT NULL DEFAULT 0, meetings INTEGER NOT NULL DEFAULT 0, note TEXT, created_at TEXT NOT NULL
-);
-`);
-db.exec('CREATE TABLE IF NOT EXISTS call_day (day TEXT PRIMARY KEY, calls_adj INTEGER NOT NULL DEFAULT 0, reached_adj INTEGER NOT NULL DEFAULT 0, owner_adj INTEGER NOT NULL DEFAULT 0, good_adj INTEGER NOT NULL DEFAULT 0, verdict TEXT, updated_at TEXT)');
-db.exec('CREATE TABLE IF NOT EXISTS outreach_adj (day TEXT NOT NULL, key TEXT NOT NULL, adj INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, key))');
-db.exec('CREATE TABLE IF NOT EXISTS email_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, taken_at TEXT NOT NULL, payload TEXT NOT NULL)');
-if (!db.prepare('PRAGMA table_info(contacts)').all().some((c) => c.name === 'mailbox')) db.exec('ALTER TABLE contacts ADD COLUMN mailbox TEXT');
-// the old "Contacted" stage was replaced by "Follow up" (2026-11-24)
-db.exec("UPDATE leads SET status = 'follow_up' WHERE status = 'contacted'");
+const Lib = require('../public/lib.js');
+const db = require('./db');
+const { ensureSchema } = require('./schema');
 
 /* ---------------- settings ---------------- */
 const DEFAULTS = {
@@ -84,18 +23,23 @@ const DEFAULTS = {
     'CALL SCRIPT (replace this with yours)\n\nOpening:\n\nHook (needs the verified competitor claim on this lead):\n\nQuestion:\n\nIf they say no:\n\nBooking line:',
 };
 const NUMERIC = ['daily_call_target', 'daily_dm_target', 'goal_amount', 'call_window_start', 'call_window_end', 'email_daily_per_mailbox'];
-function getSettings() {
+async function getSettings() {
+  const c = db.cache();
+  if (c && c.settings) return { ...c.settings };
   const out = { ...DEFAULTS };
-  for (const r of db.prepare("SELECT key, value FROM settings WHERE key NOT IN ('password_hash')").all()) {
+  for (const r of await db.all("SELECT key, value FROM settings WHERE key NOT IN ('password_hash')")) {
     if (!(r.key in DEFAULTS)) continue;
     out[r.key] = NUMERIC.includes(r.key) ? Number(r.value) : r.value;
   }
-  return out;
+  if (c) c.settings = out;
+  return { ...out };
 }
-function setSetting(key, value) {
-  db.prepare('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, String(value));
+async function setSetting(key, value) {
+  await db.run('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', key, String(value));
+  const c = db.cache();
+  if (c) c.settings = null;
 }
-const rawSetting = (k) => { const r = db.prepare('SELECT value FROM settings WHERE key=?').get(k); return r ? r.value : null; };
+const rawSetting = async (k) => { const r = await db.get('SELECT value FROM settings WHERE key = ?', k); return r ? r.value : null; };
 
 /* ---------------- helpers ---------------- */
 class HttpError extends Error { constructor(status, message, extra) { super(message); this.status = status; this.extra = extra; } }
@@ -104,10 +48,12 @@ const nowIso = () => new Date().toISOString();
 const clean = (v) => { if (v == null) return null; v = String(v).trim(); return v === '' ? null : v; };
 const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const num = (v) => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
-function tx(fn) {
-  db.exec('BEGIN');
-  try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { try { db.exec('ROLLBACK'); } catch (_) { /* ignore */ } throw e; }
-}
+const tx = (fn) => db.tx(fn);
+const safeEqual = (a, b) => {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+};
 
 const TEXT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'competitor_checked', 'external_id'];
 const LEAD_COLS = [...TEXT_FIELDS, 'phone_norm', 'email_norm', 'website_norm', 'name_city_key', 'status', 'next_followup', 'competitor_checked_date',
@@ -155,45 +101,77 @@ function leadView(r) {
   const channels = r.channels ? String(r.channels).split(',').map((x) => { const [channel, n] = x.split(':'); return { channel, count: Number(n) }; }) : [];
   return { ...r, channels, opted_out: !!r.opted_out, is_demo: !!r.is_demo, tz, tz_source: r.timezone ? 'set' : tz ? 'state' : null };
 }
-const getLeadRow = (id) => db.prepare('SELECT * FROM leads WHERE id = ?').get(id);
+const getLeadRow = (id) => db.get('SELECT * FROM leads WHERE id = ?', id);
 
-function findDuplicates(f, excludeId) {
+/* ---- duplicate checks. They work on a whole list of leads at once (3 queries, not 3 per lead), because the database is a network away. ---- */
+const DUP_COLS = 'id, business_name, owner_name, city, state, phone, website, status, opted_out, phone_norm, website_norm, name_city_key';
+async function loadDupIndex(list) {
+  const uniq = (k) => [...new Set(list.map((f) => f[k]).filter(Boolean))];
+  const phones = uniq('phone_norm'), sites = uniq('website_norm'), keys = uniq('name_city_key');
+  const idx = { phone: new Map(), site: new Map(), key: new Map() };
+  if (!phones.length && !sites.length && !keys.length) return idx;
+  const rows = await db.all(`SELECT ${DUP_COLS} FROM leads WHERE phone_norm = ANY(?::text[]) OR website_norm = ANY(?::text[]) OR name_city_key = ANY(?::text[]) ORDER BY id`, phones, sites, keys);
+  const put = (m, k, r) => { if (!k) return; if (!m.has(k)) m.set(k, []); m.get(k).push(r); };
+  for (const r of rows) { put(idx.phone, r.phone_norm, r); put(idx.site, r.website_norm, r); put(idx.key, r.name_city_key, r); }
+  return idx;
+}
+function dupsFromIndex(f, idx, excludeId) {
   const found = new Map();
   const add = (rows, reason) => {
-    for (const r of rows) {
-      if (excludeId && r.id === excludeId) continue;
+    for (const r0 of rows) {
+      if (excludeId && r0.id === excludeId) continue;
+      const r = { id: r0.id, business_name: r0.business_name, owner_name: r0.owner_name, city: r0.city, state: r0.state, phone: r0.phone, website: r0.website, status: r0.status, opted_out: r0.opted_out };
       const e = found.get(r.id) || { lead: r, reasons: [] };
       if (!e.reasons.includes(reason)) e.reasons.push(reason);
       found.set(r.id, e);
     }
   };
-  const cols = 'id, business_name, owner_name, city, state, phone, website, status, opted_out';
-  if (f.phone_norm) add(db.prepare(`SELECT ${cols} FROM leads WHERE phone_norm = ?`).all(f.phone_norm), 'same phone');
-  if (f.website_norm) add(db.prepare(`SELECT ${cols} FROM leads WHERE website_norm = ?`).all(f.website_norm), 'same website');
-  if (f.name_city_key) add(db.prepare(`SELECT ${cols} FROM leads WHERE name_city_key = ?`).all(f.name_city_key), 'same name and city');
+  if (f.phone_norm) add(idx.phone.get(f.phone_norm) || [], 'same phone');
+  if (f.website_norm) add(idx.site.get(f.website_norm) || [], 'same website');
+  if (f.name_city_key) add(idx.key.get(f.name_city_key) || [], 'same name and city');
   return [...found.values()].map((e) => ({ ...e, lead: { ...e.lead, opted_out: !!e.lead.opted_out } }));
 }
-function findOptOutMatches(f) {
-  const conds = [], args = [];
-  if (f.phone_norm) { conds.push('phone_norm = ?'); args.push(f.phone_norm); }
-  if (f.email_norm) { conds.push('email_norm = ?'); args.push(f.email_norm); }
-  if (f.website_norm) { conds.push('website_norm = ?'); args.push(f.website_norm); }
-  if (f.name_city_key) { conds.push('name_city_key = ?'); args.push(f.name_city_key); }
-  if (!conds.length) return [];
-  return db.prepare(`SELECT id, lead_id, business_name, at, channel FROM opt_outs WHERE removed_at IS NULL AND (${conds.join(' OR ')})`).all(...args);
-}
+async function findDuplicates(f, excludeId) { return dupsFromIndex(f, await loadDupIndex([f]), excludeId); }
 
-function insertLead(f) {
-  const t = nowIso();
-  const row = { status: 'new', source: 'other', opted_out: 0, is_demo: 0, ...f, created_at: f.created_at || t, updated_at: t };
-  if (!row.business_name) throw bad('Business name is required.');
-  const res = db.prepare(`INSERT INTO leads(${LEAD_COLS.join(',')}) VALUES(${LEAD_COLS.map(() => '?').join(',')})`).run(...LEAD_COLS.map((c) => (row[c] === undefined ? null : row[c])));
-  return Number(res.lastInsertRowid);
+async function loadOptOutRows(list) {
+  const uniq = (k) => [...new Set(list.map((f) => f[k]).filter(Boolean))];
+  const a = uniq('phone_norm'), b = uniq('email_norm'), c = uniq('website_norm'), d = uniq('name_city_key');
+  if (!a.length && !b.length && !c.length && !d.length) return [];
+  return db.all(`SELECT id, lead_id, business_name, "at", channel, phone_norm, email_norm, website_norm, name_city_key FROM opt_outs
+    WHERE removed_at IS NULL AND (phone_norm = ANY(?::text[]) OR email_norm = ANY(?::text[]) OR website_norm = ANY(?::text[]) OR name_city_key = ANY(?::text[])) ORDER BY id`, a, b, c, d);
 }
-function writeLead(id, f) {
+function optOutsFor(f, rows) {
+  return rows.filter((o) => (f.phone_norm && o.phone_norm === f.phone_norm) || (f.email_norm && o.email_norm === f.email_norm)
+    || (f.website_norm && o.website_norm === f.website_norm) || (f.name_city_key && o.name_city_key === f.name_city_key))
+    .map((o) => ({ id: o.id, lead_id: o.lead_id, business_name: o.business_name, at: o.at, channel: o.channel }));
+}
+async function findOptOutMatches(f) { return optOutsFor(f, await loadOptOutRows([f])); }
+
+/* Insert one or many leads, in order, and return the new ids. Many go in as a few big statements. */
+async function insertLeads(list) {
+  const t = nowIso();
+  const rows = list.map((f) => {
+    const row = { status: 'new', source: 'other', opted_out: 0, is_demo: 0, ...f, created_at: f.created_at || t, updated_at: t };
+    if (!row.business_name) throw bad('Business name is required.');
+    return row;
+  });
+  const ids = [];
+  const CHUNK = 250;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const part = rows.slice(i, i + CHUNK);
+    const marks = part.map(() => '(' + LEAD_COLS.map(() => '?').join(',') + ')').join(',');
+    const args = [];
+    for (const row of part) for (const c of LEAD_COLS) args.push(row[c] === undefined ? null : row[c]);
+    const res = await db.run(`INSERT INTO leads(${LEAD_COLS.join(',')}) VALUES ${marks} RETURNING id`, ...args);
+    for (const r of res.rows) ids.push(Number(r.id));
+  }
+  return ids;
+}
+const insertLead = async (f) => (await insertLeads([f]))[0];
+async function writeLead(id, f) {
   const row = { ...f, updated_at: nowIso() };
   const cols = LEAD_COLS.filter((c) => c !== 'created_at');
-  db.prepare(`UPDATE leads SET ${cols.map((c) => c + ' = ?').join(', ')} WHERE id = ?`).run(...cols.map((c) => (row[c] === undefined ? null : row[c])), id);
+  await db.run(`UPDATE leads SET ${cols.map((c) => c + ' = ?').join(', ')} WHERE id = ?`, ...cols.map((c) => (row[c] === undefined ? null : row[c])), id);
 }
 
 /* ---------------- status + follow-up rules ---------------- */
@@ -205,10 +183,10 @@ function nextStatus(cur, outcome) {
   if (cur === 'not_interested') return ['replied', 'call_booked'].includes(target) ? target : cur;
   return Lib.STATUS_RANK[target] > Lib.STATUS_RANK[cur] ? target : cur;
 }
-const todayKey = (now) => Lib.dayKey(now || new Date(), getSettings().my_timezone);
+const todayKey = async (now) => Lib.dayKey(now || new Date(), (await getSettings()).my_timezone);
 
-function addContact(leadId, b, now) {
-  const lead = getLeadRow(leadId);
+async function addContact(leadId, b, now) {
+  const lead = await getLeadRow(leadId);
   if (!lead) throw new HttpError(404, 'Lead not found');
   if (lead.opted_out) throw new HttpError(409, 'This lead is opted out. No contact can be logged.');
   if (!Lib.OUTCOMES[b.channel]) throw bad('Unknown channel.');
@@ -223,29 +201,29 @@ function addContact(leadId, b, now) {
   } else {
     const days = Lib.FOLLOWUP_DAYS[b.outcome];
     followup = days == null || ['closed', 'not_interested', 'call_booked', 'proposal_sent'].includes(status) && days == null
-      ? null : Lib.addBizDays(todayKey(now), days);
+      ? null : Lib.addBizDays(await todayKey(now), days);
   }
   if (status === 'closed' || status === 'not_interested') followup = null;
   const direction = ['replied'].includes(b.outcome) ? 'in' : 'out';
-  return tx(() => {
-    const res = db.prepare('INSERT INTO contacts(lead_id, channel, outcome, direction, content, note, at, external_id, mailbox, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
-      .run(leadId, b.channel, b.outcome, direction, clean(b.content), clean(b.note), at, clean(b.external_id), b.channel === 'email' ? clean(b.mailbox) : null, nowIso());
-    db.prepare('UPDATE leads SET status = ?, next_followup = ?, updated_at = ? WHERE id = ?').run(status, followup, nowIso(), leadId);
-    const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(Number(res.lastInsertRowid));
-    return { contact, lead: leadView(getLeadRow(leadId)), followup };
+  return tx(async () => {
+    const res = await db.run('INSERT INTO contacts(lead_id, channel, outcome, direction, content, note, "at", external_id, mailbox, created_at) VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING id',
+      leadId, b.channel, b.outcome, direction, clean(b.content), clean(b.note), at, clean(b.external_id), b.channel === 'email' ? clean(b.mailbox) : null, nowIso());
+    await db.run('UPDATE leads SET status = ?, next_followup = ?, updated_at = ? WHERE id = ?', status, followup, nowIso(), leadId);
+    const contact = await db.get('SELECT * FROM contacts WHERE id = ?', Number(res.rows[0].id));
+    return { contact, lead: leadView(await getLeadRow(leadId)), followup };
   });
 }
 
 /* ---------------- listing + detail ---------------- */
 const LEAD_LIST_SQL = `SELECT l.*,
-  (SELECT at FROM contacts c WHERE c.lead_id = l.id ORDER BY at DESC LIMIT 1) AS last_at,
-  (SELECT channel FROM contacts c WHERE c.lead_id = l.id ORDER BY at DESC LIMIT 1) AS last_channel,
-  (SELECT outcome FROM contacts c WHERE c.lead_id = l.id ORDER BY at DESC LIMIT 1) AS last_outcome,
+  (SELECT "at" FROM contacts c WHERE c.lead_id = l.id ORDER BY "at" DESC, c.id DESC LIMIT 1) AS last_at,
+  (SELECT channel FROM contacts c WHERE c.lead_id = l.id ORDER BY "at" DESC, c.id DESC LIMIT 1) AS last_channel,
+  (SELECT outcome FROM contacts c WHERE c.lead_id = l.id ORDER BY "at" DESC, c.id DESC LIMIT 1) AS last_outcome,
   (SELECT COUNT(*) FROM contacts c WHERE c.lead_id = l.id) AS contact_count,
-  (SELECT GROUP_CONCAT(channel || ':' || n) FROM (SELECT channel, COUNT(*) AS n FROM contacts c2 WHERE c2.lead_id = l.id GROUP BY channel)) AS channels
+  (SELECT string_agg(g.channel || ':' || g.n, ',' ORDER BY g.channel) FROM (SELECT channel, COUNT(*) AS n FROM contacts c2 WHERE c2.lead_id = l.id GROUP BY channel) g) AS channels
   FROM leads l`;
 
-function listLeads(q) {
+async function listLeads(q) {
   const where = [], args = [];
   if (q.q) {
     const like = '%' + String(q.q).toLowerCase() + '%';
@@ -262,58 +240,63 @@ function listLeads(q) {
   if (q.opted === '0') where.push('l.opted_out = 0');
   if (q.demo === '1') where.push('l.is_demo = 1');
   const w = where.length ? ' WHERE ' + where.join(' AND ') : '';
-  const total = db.prepare('SELECT COUNT(*) AS n FROM leads l' + w).get(...args).n;
-  const sort = { name: 'l.business_name COLLATE NOCASE ASC', recent: 'l.created_at DESC', followup: "(l.next_followup IS NULL), l.next_followup ASC", touched: 'l.last_touch DESC' }[q.sort] || 'l.created_at DESC, l.id DESC';
+  const total = (await db.get('SELECT COUNT(*) AS n FROM leads l' + w, ...args)).n;
+  const sort = {
+    name: 'lower(l.business_name) ASC, l.id ASC',
+    recent: 'l.created_at DESC, l.id DESC',
+    followup: '(l.next_followup IS NULL), l.next_followup ASC, l.id ASC',
+    touched: 'last_at DESC NULLS LAST, l.id DESC',
+  }[q.sort] || 'l.created_at DESC, l.id DESC';
   const limit = Math.min(Number(q.limit) || 200, 1000), offset = Number(q.offset) || 0;
-  const rows = db.prepare(LEAD_LIST_SQL.replace('FROM leads l', 'FROM leads l') + w + ' ORDER BY ' + sort.replace('l.last_touch DESC', 'last_at DESC') + ' LIMIT ? OFFSET ?').all(...args, limit, offset);
+  const rows = await db.all(LEAD_LIST_SQL + w + ' ORDER BY ' + sort + ' LIMIT ? OFFSET ?', ...args, limit, offset);
   return { total, rows: rows.map(leadView) };
 }
 
-function leadDetail(id) {
-  const r = getLeadRow(id);
+async function leadDetail(id) {
+  const r = await getLeadRow(id);
   if (!r) throw new HttpError(404, 'Lead not found');
   return {
     lead: leadView(r),
-    contacts: db.prepare('SELECT * FROM contacts WHERE lead_id = ? ORDER BY at DESC, id DESC').all(id),
-    deal: db.prepare('SELECT * FROM deals WHERE lead_id = ?').get(id) || null,
-    optouts: db.prepare('SELECT * FROM opt_outs WHERE lead_id = ? ORDER BY at DESC, id DESC').all(id),
+    contacts: await db.all('SELECT * FROM contacts WHERE lead_id = ? ORDER BY "at" DESC, id DESC', id),
+    deal: (await db.get('SELECT * FROM deals WHERE lead_id = ?', id)) || null,
+    optouts: await db.all('SELECT * FROM opt_outs WHERE lead_id = ? ORDER BY "at" DESC, id DESC', id),
   };
 }
 
 /* ---------------- opt out ---------------- */
-function optOut(id, b) {
-  const lead = getLeadRow(id);
+async function optOut(id, b) {
+  const lead = await getLeadRow(id);
   if (!lead) throw new HttpError(404, 'Lead not found');
   if (lead.opted_out) throw new HttpError(409, 'Already opted out.');
   const ch = b.channel === 'all' || !b.channel ? 'all' : b.channel;
   if (ch !== 'all' && !Lib.CHANNEL_LABEL[ch]) throw bad('Unknown channel.');
   let at = nowIso();
   if (b.at) { const d = new Date(b.at); if (isNaN(d)) throw bad('Bad date/time.'); at = d.toISOString(); }
-  return tx(() => {
-    db.prepare('INSERT INTO opt_outs(lead_id, business_name, phone_norm, email_norm, website_norm, name_city_key, at, channel, note) VALUES(?,?,?,?,?,?,?,?,?)')
-      .run(id, lead.business_name, lead.phone_norm, lead.email_norm, lead.website_norm, lead.name_city_key, at, ch, clean(b.note));
-    db.prepare('UPDATE leads SET opted_out = 1, opt_out_date = ?, opt_out_channel = ?, next_followup = NULL, updated_at = ? WHERE id = ?').run(at, ch, nowIso(), id);
+  return tx(async () => {
+    await db.run('INSERT INTO opt_outs(lead_id, business_name, phone_norm, email_norm, website_norm, name_city_key, "at", channel, note) VALUES(?,?,?,?,?,?,?,?,?)',
+      id, lead.business_name, lead.phone_norm, lead.email_norm, lead.website_norm, lead.name_city_key, at, ch, clean(b.note));
+    await db.run('UPDATE leads SET opted_out = 1, opt_out_date = ?, opt_out_channel = ?, next_followup = NULL, updated_at = ? WHERE id = ?', at, ch, nowIso(), id);
     return leadDetail(id);
   });
 }
-function removeOptOut(id, b) {
-  const lead = getLeadRow(id);
+async function removeOptOut(id, b) {
+  const lead = await getLeadRow(id);
   if (!lead) throw new HttpError(404, 'Lead not found');
   if (!lead.opted_out) throw new HttpError(409, 'This lead is not opted out.');
   if (b.confirm !== 'REMOVE') throw bad('Type REMOVE to confirm. This lead will become contactable again.');
-  return tx(() => {
-    db.prepare('UPDATE opt_outs SET removed_at = ?, removed_note = ? WHERE lead_id = ? AND removed_at IS NULL').run(nowIso(), clean(b.note), id);
-    db.prepare('UPDATE leads SET opted_out = 0, opt_out_date = NULL, opt_out_channel = NULL, updated_at = ? WHERE id = ?').run(nowIso(), id);
+  return tx(async () => {
+    await db.run('UPDATE opt_outs SET removed_at = ?, removed_note = ? WHERE lead_id = ? AND removed_at IS NULL', nowIso(), clean(b.note), id);
+    await db.run('UPDATE leads SET opted_out = 0, opt_out_date = NULL, opt_out_channel = NULL, updated_at = ? WHERE id = ?', nowIso(), id);
     return leadDetail(id);
   });
 }
 
 /* ---------------- deals ---------------- */
-function putDeal(id, b) {
-  const lead = getLeadRow(id);
+async function putDeal(id, b) {
+  const lead = await getLeadRow(id);
   if (!lead) throw new HttpError(404, 'Lead not found');
-  const s = getSettings();
-  const cur = db.prepare('SELECT * FROM deals WHERE lead_id = ?').get(id) || {};
+  const s = await getSettings();
+  const cur = (await db.get('SELECT * FROM deals WHERE lead_id = ?', id)) || {};
   const d = { ...cur };
   if ('call_at_local' in b) d.call_at = b.call_at_local ? Lib.zonedToUtc(b.call_at_local, s.my_timezone) : null;
   if ('call_at' in b) d.call_at = b.call_at ? new Date(b.call_at).toISOString() : null;
@@ -325,12 +308,12 @@ function putDeal(id, b) {
     if (k in b) { if (b[k] && !isDate(b[k])) throw bad(k + ' must be a date.'); d[k] = b[k] || null; }
   }
   for (const k of ['deposit_amount', 'deal_value']) if (k in b) d[k] = num(b[k]);
-  return tx(() => {
-    db.prepare(`INSERT INTO deals(lead_id, call_at, call_result, proposal_sent_date, deposit_paid_date, deposit_amount, signed_date, deal_value, updated_at)
+  return tx(async () => {
+    await db.run(`INSERT INTO deals(lead_id, call_at, call_result, proposal_sent_date, deposit_paid_date, deposit_amount, signed_date, deal_value, updated_at)
       VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(lead_id) DO UPDATE SET call_at=excluded.call_at, call_result=excluded.call_result,
       proposal_sent_date=excluded.proposal_sent_date, deposit_paid_date=excluded.deposit_paid_date, deposit_amount=excluded.deposit_amount,
-      signed_date=excluded.signed_date, deal_value=excluded.deal_value, updated_at=excluded.updated_at`)
-      .run(id, d.call_at ?? null, d.call_result ?? null, d.proposal_sent_date ?? null, d.deposit_paid_date ?? null, d.deposit_amount ?? null, d.signed_date ?? null, d.deal_value ?? null, nowIso());
+      signed_date=excluded.signed_date, deal_value=excluded.deal_value, updated_at=excluded.updated_at`,
+    id, d.call_at ?? null, d.call_result ?? null, d.proposal_sent_date ?? null, d.deposit_paid_date ?? null, d.deposit_amount ?? null, d.signed_date ?? null, d.deal_value ?? null, nowIso());
     let status = lead.status, followup = lead.next_followup;
     if (d.signed_date) { status = 'closed'; followup = null; }
     else {
@@ -338,7 +321,7 @@ function putDeal(id, b) {
       if (d.proposal_sent_date && Lib.STATUS_RANK[status] < Lib.STATUS_RANK.proposal_sent && status !== 'not_interested') status = 'proposal_sent';
       else if (d.call_at && Lib.STATUS_RANK[status] < Lib.STATUS_RANK.call_booked && status !== 'not_interested') status = 'call_booked';
     }
-    db.prepare('UPDATE leads SET status = ?, next_followup = ?, updated_at = ? WHERE id = ?').run(status, followup, nowIso(), id);
+    await db.run('UPDATE leads SET status = ?, next_followup = ?, updated_at = ? WHERE id = ?', status, followup, nowIso(), id);
     return leadDetail(id);
   });
 }
@@ -358,39 +341,37 @@ const ACTIVE = "l.opted_out = 0 AND l.status NOT IN ('closed','not_interested')"
 const CALL_ELIGIBLE = "l.opted_out = 0 AND l.status IN ('new','follow_up','replied') AND l.phone_norm IS NOT NULL";
 const intOr0 = (v) => { const n = Math.floor(Number(v)); return Number.isFinite(n) && n > 0 ? Math.min(n, 100000) : 0; };
 
-function todayData(now, followLimit) {
-  const s = getSettings();
+async function todayData(now, followLimit) {
+  const s = await getSettings();
   const today = Lib.dayKey(now, s.my_timezone);
-  const since = new Date(now.getTime() - 3 * 86400000).toISOString();
-  const todays = db.prepare('SELECT channel, outcome, at FROM contacts WHERE at >= ?').all(since).filter((c) => Lib.dayKey(c.at, s.my_timezone) === today);
   const progress = {
     today,
     calls: 0, calls_target: s.daily_call_target, dms: 0, dms_target: s.daily_dm_target,
   };
-  const outreach = outreachDay(today, now);
+  const outreach = await outreachDay(today, now);
   progress.calls = outreach.items.find((i) => i.key === 'call').total;
   progress.dms = outreach.items.filter((i) => ['instagram_dm', 'facebook_dm'].includes(i.key)).reduce((n, i) => n + i.total, 0);
   const dueWhere = `${ACTIVE} AND l.next_followup IS NOT NULL AND l.next_followup <= ?`;
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM leads l WHERE ${dueWhere}`).get(today).n;
-  const overdue = db.prepare(`SELECT COUNT(*) AS n FROM leads l WHERE ${dueWhere} AND l.next_followup < ?`).get(today, today).n;
-  const rows = db.prepare(LEAD_LIST_SQL + ` WHERE ${dueWhere} ORDER BY l.next_followup ASC, l.id ASC LIMIT ?`).all(today, Math.min(Number(followLimit) || 8, 200))
+  const total = (await db.get(`SELECT COUNT(*) AS n FROM leads l WHERE ${dueWhere}`, today)).n;
+  const overdue = (await db.get(`SELECT COUNT(*) AS n FROM leads l WHERE ${dueWhere} AND l.next_followup < ?`, today, today)).n;
+  const rows = (await db.all(LEAD_LIST_SQL + ` WHERE ${dueWhere} ORDER BY l.next_followup ASC, l.id ASC LIMIT ?`, today, Math.min(Number(followLimit) || 8, 200)))
     .map((r) => ({ ...leadLite(r, now, s), overdue: r.next_followup < today, email: r.email }));
-  const booked = db.prepare(`SELECT d.*, l.business_name, l.owner_name, l.phone, l.city, l.state, l.timezone, l.id AS lid FROM deals d JOIN leads l ON l.id = d.lead_id
+  const booked = (await db.all(`SELECT d.*, l.business_name, l.owner_name, l.phone, l.city, l.state, l.timezone, l.id AS lid FROM deals d JOIN leads l ON l.id = d.lead_id
     WHERE l.opted_out = 0 AND d.call_at IS NOT NULL AND d.call_at >= ? AND d.call_at <= ? AND (d.call_result IS NULL OR d.call_result = 'pending')
-    ORDER BY d.call_at ASC`).all(new Date(now.getTime() - 3 * 3600000).toISOString(), new Date(now.getTime() + 72 * 3600000).toISOString())
+    ORDER BY d.call_at ASC`, new Date(now.getTime() - 3 * 3600000).toISOString(), new Date(now.getTime() + 72 * 3600000).toISOString()))
     .map((d) => ({ lead_id: d.lid, business_name: d.business_name, owner_name: d.owner_name, phone: d.phone, city: d.city, state: d.state,
       tz: Lib.tzForLead(d), call_at: d.call_at, hours_away: Math.round(((new Date(d.call_at) - now) / 3600000) * 10) / 10 }));
-  return { now: now.toISOString(), progress, outreach, followups_total: total, followups_overdue: overdue, followups: rows, booked, goal: goalData(now), window: { start: s.call_window_start, end: s.call_window_end }, my_timezone: s.my_timezone };
+  return { now: now.toISOString(), progress, outreach, followups_total: total, followups_overdue: overdue, followups: rows, booked, goal: await goalData(now), window: { start: s.call_window_start, end: s.call_window_end }, my_timezone: s.my_timezone };
 }
 
 /* Follow-ups page: everything due (or coming up), filterable by the channel of the last contact. */
-function followupsData(now, q) {
-  const s = getSettings();
+async function followupsData(now, q) {
+  const s = await getSettings();
   const today = Lib.dayKey(now, s.my_timezone);
   const soon = q.scope === 'soon';
   const cond = soon ? 'l.next_followup > ? AND l.next_followup <= ?' : 'l.next_followup <= ?';
   const args = soon ? [today, Lib.addDaysKey(today, 7)] : [today];
-  const all = db.prepare(LEAD_LIST_SQL + ` WHERE ${ACTIVE} AND l.next_followup IS NOT NULL AND ${cond} ORDER BY l.next_followup ASC, l.id ASC`).all(...args);
+  const all = await db.all(LEAD_LIST_SQL + ` WHERE ${ACTIVE} AND l.next_followup IS NOT NULL AND ${cond} ORDER BY l.next_followup ASC, l.id ASC`, ...args);
   const inGroup = (r, g) => Lib.CHANNEL_GROUPS[g].includes(r.last_channel);
   const counts = { all: all.length };
   for (const g of Object.keys(Lib.CHANNEL_GROUPS)) counts[g] = all.filter((r) => inGroup(r, g)).length;
@@ -409,50 +390,50 @@ const autoCounts = (calls) => ({
   good: calls.filter((c) => Lib.GOOD_OUTCOMES.includes(c.outcome)).length,
 });
 const ZERO_ADJ = { calls_adj: 0, reached_adj: 0, owner_adj: 0, good_adj: 0, verdict: null };
-const dayRow = (day) => db.prepare('SELECT * FROM call_day WHERE day = ?').get(day) || { day, ...ZERO_ADJ };
+const dayRow = async (day) => (await db.get('SELECT * FROM call_day WHERE day = ?', day)) || { day, ...ZERO_ADJ };
 const withAdj = (auto, row) => ({
   calls: Math.max(0, auto.calls + row.calls_adj), reached: Math.max(0, auto.reached + row.reached_adj),
   owner: Math.max(0, auto.owner + row.owner_adj), good: Math.max(0, auto.good + row.good_adj),
 });
-function callsOnDay(day, tz) {
+async function callsOnDay(day, tz) {
   const mid = Date.parse(day + 'T00:00:00Z');
   const lo = new Date(mid - 36 * 3600000).toISOString(), hi = new Date(mid + 60 * 3600000).toISOString();
-  return db.prepare("SELECT outcome, at FROM contacts WHERE channel = 'call' AND at >= ? AND at <= ?").all(lo, hi).filter((c) => Lib.dayKey(c.at, tz) === day);
+  return (await db.all("SELECT outcome, \"at\" FROM contacts WHERE channel = 'call' AND \"at\" >= ? AND \"at\" <= ?", lo, hi)).filter((c) => Lib.dayKey(c.at, tz) === day);
 }
-function dayData(day, now) {
-  const s = getSettings();
+async function dayData(day, now) {
+  const s = await getSettings();
   if (!isDate(day)) throw bad('Day must be a date.');
-  const auto = autoCounts(callsOnDay(day, s.my_timezone));
-  const row = dayRow(day);
+  const auto = autoCounts(await callsOnDay(day, s.my_timezone));
+  const row = await dayRow(day);
   const today = Lib.dayKey(now, s.my_timezone);
   return { day, today, is_today: day === today, auto, adj: { calls: row.calls_adj, reached: row.reached_adj, owner: row.owner_adj, good: row.good_adj },
     totals: withAdj(auto, row), verdict: row.verdict || '' };
 }
-function setDay(b, now) {
-  const s = getSettings();
+async function setDay(b, now) {
+  const s = await getSettings();
   const day = b.day;
   if (!isDate(day)) throw bad('Day must be a date.');
   if (day > Lib.dayKey(now, s.my_timezone)) throw bad('You cannot log a day that has not happened yet.');
-  const auto = autoCounts(callsOnDay(day, s.my_timezone));
-  const row = { ...dayRow(day) };
+  const auto = autoCounts(await callsOnDay(day, s.my_timezone));
+  const row = { ...(await dayRow(day)) };
   if (b.field) {
     if (!COUNT_FIELDS[b.field]) throw bad('Unknown counter.');
     const value = intOr0(b.value);
     row[COUNT_FIELDS[b.field]] = value - auto[b.field]; // the counter shows what you set; the difference from your logged calls is kept as the adjustment
   }
   if ('verdict' in b) row.verdict = String(b.verdict || '').slice(0, 5000) || null;
-  db.prepare(`INSERT INTO call_day(day, calls_adj, reached_adj, owner_adj, good_adj, verdict, updated_at) VALUES(?,?,?,?,?,?,?)
-    ON CONFLICT(day) DO UPDATE SET calls_adj = excluded.calls_adj, reached_adj = excluded.reached_adj, owner_adj = excluded.owner_adj, good_adj = excluded.good_adj, verdict = excluded.verdict, updated_at = excluded.updated_at`)
-    .run(day, row.calls_adj, row.reached_adj, row.owner_adj, row.good_adj, row.verdict, nowIso());
+  await db.run(`INSERT INTO call_day(day, calls_adj, reached_adj, owner_adj, good_adj, verdict, updated_at) VALUES(?,?,?,?,?,?,?)
+    ON CONFLICT(day) DO UPDATE SET calls_adj = excluded.calls_adj, reached_adj = excluded.reached_adj, owner_adj = excluded.owner_adj, good_adj = excluded.good_adj, verdict = excluded.verdict, updated_at = excluded.updated_at`,
+  day, row.calls_adj, row.reached_adj, row.owner_adj, row.good_adj, row.verdict, nowIso());
   return dayData(day, now);
 }
 /* the 7 most recent days with anything on them, newest first, with averages (like the Cold Call Tracker's "Last 7 Days") */
-function dayHistory(now) {
-  const s = getSettings();
+async function dayHistory(now) {
+  const s = await getSettings();
   const tz = s.my_timezone;
-  const calls = db.prepare("SELECT outcome, at FROM contacts WHERE channel = 'call' AND at >= ?").all(new Date(now.getTime() - 120 * 86400000).toISOString()).map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
+  const calls = (await db.all("SELECT outcome, \"at\" FROM contacts WHERE channel = 'call' AND \"at\" >= ?", new Date(now.getTime() - 120 * 86400000).toISOString())).map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
   const days = new Set(calls.map((c) => c.day));
-  const adjRows = db.prepare('SELECT * FROM call_day').all();
+  const adjRows = await db.all('SELECT * FROM call_day');
   const adjBy = Object.fromEntries(adjRows.map((r) => [r.day, r]));
   for (const r of adjRows) if (r.calls_adj || r.reached_adj || r.owner_adj || r.good_adj || r.verdict) days.add(r.day);
   const list = [...days].sort().reverse().slice(0, 7).map((day) => {
@@ -471,14 +452,14 @@ const OUTREACH = [
   { key: 'facebook_dm', label: 'Facebook DMs', channel: 'facebook_dm' },
   { key: 'email', label: 'Emails', channel: 'email' },
 ];
-function outreachDay(day, now) {
-  const s = getSettings();
+async function outreachDay(day, now) {
+  const s = await getSettings();
   const tz = s.my_timezone;
   const mid = Date.parse(day + 'T00:00:00Z');
   const lo = new Date(mid - 36 * 3600000).toISOString(), hi = new Date(mid + 60 * 3600000).toISOString();
-  const rows = db.prepare("SELECT channel, outcome, at FROM contacts WHERE at >= ? AND at <= ? AND channel IN ('call','instagram_dm','facebook_dm','email')").all(lo, hi).filter((c) => Lib.dayKey(c.at, tz) === day);
-  const adjRows = Object.fromEntries(db.prepare('SELECT key, adj FROM outreach_adj WHERE day = ?').all(day).map((r) => [r.key, r.adj]));
-  const callRow = dayRow(day);
+  const rows = (await db.all("SELECT channel, outcome, \"at\" FROM contacts WHERE \"at\" >= ? AND \"at\" <= ? AND channel IN ('call','instagram_dm','facebook_dm','email')", lo, hi)).filter((c) => Lib.dayKey(c.at, tz) === day);
+  const adjRows = Object.fromEntries((await db.all('SELECT key, adj FROM outreach_adj WHERE day = ?', day)).map((r) => [r.key, r.adj]));
+  const callRow = await dayRow(day);
   const items = OUTREACH.map((o) => {
     // a call is any call you logged; a DM or an email counts when you logged it as Sent
     const auto = rows.filter((c) => c.channel === o.channel && (o.channel === 'call' || c.outcome === 'sent')).length;
@@ -488,25 +469,25 @@ function outreachDay(day, now) {
   const today = Lib.dayKey(now, tz);
   return { day, today, is_today: day === today, items, total: items.reduce((n, i) => n + i.total, 0) };
 }
-function setOutreach(b, now) {
-  const s = getSettings();
+async function setOutreach(b, now) {
+  const s = await getSettings();
   const o = OUTREACH.find((x) => x.key === b.key);
   if (!o) throw bad('Unknown counter.');
   if (!isDate(b.day)) throw bad('Day must be a date.');
   if (b.day > Lib.dayKey(now, s.my_timezone)) throw bad('You cannot log a day that has not happened yet.');
-  if (o.key === 'call') { setDay({ day: b.day, field: 'calls', value: b.value }, now); return outreachDay(b.day, now); }
-  const cur = outreachDay(b.day, now).items.find((i) => i.key === o.key);
+  if (o.key === 'call') { await setDay({ day: b.day, field: 'calls', value: b.value }, now); return outreachDay(b.day, now); }
+  const cur = (await outreachDay(b.day, now)).items.find((i) => i.key === o.key);
   const value = intOr0(b.value);
-  db.prepare('INSERT INTO outreach_adj(day, key, adj) VALUES(?,?,?) ON CONFLICT(day, key) DO UPDATE SET adj = excluded.adj').run(b.day, o.key, value - cur.auto);
+  await db.run('INSERT INTO outreach_adj(day, key, adj) VALUES(?,?,?) ON CONFLICT(day, key) DO UPDATE SET adj = excluded.adj', b.day, o.key, value - cur.auto);
   return outreachDay(b.day, now);
 }
 
 /* Calls page: the call queue and the numbers that matter for calling. */
-function callsData(now, period, readyLimit) {
-  const s = getSettings();
+async function callsData(now, period, readyLimit) {
+  const s = await getSettings();
   const tz = s.my_timezone;
   const today = Lib.dayKey(now, tz);
-  const cands = db.prepare(LEAD_LIST_SQL + ` WHERE ${CALL_ELIGIBLE} AND (l.next_followup IS NULL OR l.next_followup <= ?)`).all(today).map((r) => leadLite(r, now, s));
+  const cands = (await db.all(LEAD_LIST_SQL + ` WHERE ${CALL_ELIGIBLE} AND (l.next_followup IS NULL OR l.next_followup <= ?)`, today)).map((r) => leadLite(r, now, s));
   const ready = cands.filter((l) => l.window.ok).sort((a, b) => a.window.minsLeft - b.window.minsLeft || a.id - b.id);
   const later = cands.filter((l) => !l.window.ok && !l.window.unknown).sort((a, b) => a.window.minsUntilOpen - b.window.minsUntilOpen || a.id - b.id);
   const noTz = cands.filter((l) => l.window.unknown);
@@ -514,9 +495,9 @@ function callsData(now, period, readyLimit) {
   const per = ['today', 'week', 'month'].includes(period) ? period : 'today';
   const start = per === 'today' ? today : per === 'week' ? Lib.mondayOf(today) : Lib.addDaysKey(today, -29);
   const fromIso = new Date(now.getTime() - 40 * 86400000).toISOString();
-  const calls = db.prepare("SELECT c.outcome, c.at, l.state, l.timezone FROM contacts c JOIN leads l ON l.id = c.lead_id WHERE c.channel = 'call' AND c.at >= ?").all(fromIso)
+  const calls = (await db.all("SELECT c.outcome, c.\"at\", l.state, l.timezone FROM contacts c JOIN leads l ON l.id = c.lead_id WHERE c.channel = 'call' AND c.\"at\" >= ?", fromIso))
     .map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
-  const adjBy = Object.fromEntries(db.prepare('SELECT * FROM call_day WHERE day >= ?').all(Lib.addDaysKey(today, -40)).map((r) => [r.day, r]));
+  const adjBy = Object.fromEntries((await db.all('SELECT * FROM call_day WHERE day >= ?', Lib.addDaysKey(today, -40))).map((r) => [r.day, r]));
   const dayTot = (d) => {
     const lc = calls.filter((c) => c.day === d);
     return { ...withAdj(autoCounts(lc), adjBy[d] || ZERO_ADJ), meetings: lc.filter((c) => c.outcome === 'booked').length };
@@ -546,7 +527,7 @@ function callsData(now, period, readyLimit) {
     o.dials++; if (Lib.REACHED_OUTCOMES.includes(c.outcome)) o.reached++;
   }
   const by_hour = Object.values(hours).sort((a, b) => a.hour - b.hour).map((h) => ({ ...h, rate: h.dials ? h.reached / h.dials : null }));
-  const ds = db.prepare("SELECT SUM(call_result='show') AS shows, SUM(call_result='no_show') AS noshows FROM deals").get();
+  const ds = await db.get("SELECT COUNT(*) FILTER (WHERE call_result = 'show') AS shows, COUNT(*) FILTER (WHERE call_result = 'no_show') AS noshows FROM deals");
   const shows = ds.shows || 0, noshows = ds.noshows || 0;
   const rl = Math.min(Number(readyLimit) || 40, 400);
   return {
@@ -557,11 +538,11 @@ function callsData(now, period, readyLimit) {
   };
 }
 
-function goalData(now) {
-  const s = getSettings();
-  const signed = db.prepare('SELECT COALESCE(SUM(d.deal_value),0) AS v, COUNT(*) AS n FROM deals d WHERE d.signed_date IS NOT NULL').get();
-  const dep = db.prepare('SELECT COALESCE(SUM(deposit_amount),0) AS v FROM deals WHERE deposit_paid_date IS NOT NULL').get();
-  const pipe = db.prepare("SELECT COALESCE(SUM(d.deal_value),0) AS v, COUNT(*) AS n FROM deals d JOIN leads l ON l.id=d.lead_id WHERE d.signed_date IS NULL AND l.status IN ('call_booked','proposal_sent') AND l.opted_out=0").get();
+async function goalData(now) {
+  const s = await getSettings();
+  const signed = await db.get('SELECT COALESCE(SUM(d.deal_value),0) AS v, COUNT(*) AS n FROM deals d WHERE d.signed_date IS NOT NULL');
+  const dep = await db.get('SELECT COALESCE(SUM(deposit_amount),0) AS v FROM deals WHERE deposit_paid_date IS NOT NULL');
+  const pipe = await db.get("SELECT COALESCE(SUM(d.deal_value),0) AS v, COUNT(*) AS n FROM deals d JOIN leads l ON l.id=d.lead_id WHERE d.signed_date IS NULL AND l.status IN ('call_booked','proposal_sent') AND l.opted_out=0");
   const today = Lib.dayKey(now, s.my_timezone);
   const daysLeft = Math.max(0, Lib.daysBetween(today, s.goal_date));
   const remaining = Math.max(0, s.goal_amount - signed.v);
@@ -570,14 +551,14 @@ function goalData(now) {
 }
 
 /* ---------------- stats ---------------- */
-function statsData(now, days, weeks) {
-  const s = getSettings();
+async function statsData(now, days, weeks) {
+  const s = await getSettings();
   const tz = s.my_timezone;
   const today = Lib.dayKey(now, tz);
   const startDay = Lib.addDaysKey(today, -(days - 1));
   const startWeek = Lib.addDaysKey(Lib.mondayOf(today), -7 * (weeks - 1));
   const fromIso = new Date(now.getTime() - (Math.max(days, weeks * 7) + 9) * 86400000).toISOString();
-  const rows = db.prepare('SELECT c.id, c.lead_id, c.channel, c.outcome, c.at, l.source FROM contacts c JOIN leads l ON l.id = c.lead_id WHERE c.at >= ?').all(fromIso)
+  const rows = (await db.all('SELECT c.id, c.lead_id, c.channel, c.outcome, c."at", l.source FROM contacts c JOIN leads l ON l.id = c.lead_id WHERE c."at" >= ?', fromIso))
     .map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
   const blank = () => ({ calls: 0, dms: 0, groups: 0, emails: 0, texts: 0, replies: 0, booked: 0 });
   const bump = (o, c) => {
@@ -601,7 +582,7 @@ function statsData(now, days, weeks) {
     if (wk in wIdx) bump(weekly[wIdx[wk]], c);
   }
   // all-time conversion tables
-  const all = db.prepare('SELECT c.lead_id, c.channel, c.outcome, l.source FROM contacts c JOIN leads l ON l.id = c.lead_id').all();
+  const all = await db.all('SELECT c.lead_id, c.channel, c.outcome, l.source FROM contacts c JOIN leads l ON l.id = c.lead_id');
   const RESP = Lib.RESPONSE_OUTCOMES;
   const byChannel = Lib.CHANNELS.map((ch) => {
     const mine = all.filter((c) => c.channel === ch.id);
@@ -611,11 +592,11 @@ function statsData(now, days, weeks) {
     return { channel: ch.id, label: ch.label, attempts: mine.length, leads: leads.size, responded: resp.size, booked: book.size,
       response_rate: leads.size ? resp.size / leads.size : null, booked_rate: leads.size ? book.size / leads.size : null };
   });
-  const leadRows = db.prepare('SELECT id, source, status FROM leads WHERE opted_out = 0 OR 1').all();
+  const leadRows = await db.all('SELECT id, source, status FROM leads');
   const touched = new Set(all.map((c) => c.lead_id));
   const respAny = new Set(all.filter((c) => RESP.includes(c.outcome)).map((c) => c.lead_id));
   const bookAny = new Set(all.filter((c) => c.outcome === 'booked').map((c) => c.lead_id));
-  const dealBooked = new Set(db.prepare('SELECT lead_id FROM deals WHERE call_at IS NOT NULL').all().map((r) => r.lead_id));
+  const dealBooked = new Set((await db.all('SELECT lead_id FROM deals WHERE call_at IS NOT NULL')).map((r) => r.lead_id));
   const bySource = Lib.SOURCES.map((src) => {
     const ls = leadRows.filter((l) => l.source === src.id);
     const contacted = ls.filter((l) => touched.has(l.id));
@@ -627,9 +608,9 @@ function statsData(now, days, weeks) {
       response_rate: n ? replied.length / n : null, booked_rate: n ? booked.length / n : null, close_rate: n ? closed.length / n : null };
   });
   const funnel = Lib.STATUSES.map((st) => ({ status: st, label: Lib.STATUS_LABEL[st], count: leadRows.filter((l) => l.status === st).length }));
-  const dealStats = db.prepare("SELECT SUM(call_result='show') AS shows, SUM(call_result='no_show') AS noshows FROM deals").get();
+  const dealStats = await db.get("SELECT COUNT(*) FILTER (WHERE call_result = 'show') AS shows, COUNT(*) FILTER (WHERE call_result = 'no_show') AS noshows FROM deals");
   const shows = dealStats.shows || 0, noshows = dealStats.noshows || 0;
-  const overdue = db.prepare("SELECT COUNT(*) AS n FROM leads WHERE opted_out = 0 AND status NOT IN ('closed','not_interested') AND next_followup IS NOT NULL AND next_followup < ?").get(today).n;
+  const overdue = (await db.get("SELECT COUNT(*) AS n FROM leads WHERE opted_out = 0 AND status NOT IN ('closed','not_interested') AND next_followup IS NOT NULL AND next_followup < ?", today)).n;
   return { today, daily, weekly, byChannel, bySource, funnel, show_rate: shows + noshows ? shows / (shows + noshows) : null, shows, noshows, overdue_followups: overdue,
     totals: { leads: leadRows.length, contacted: touched.size, replied: respAny.size, booked: new Set([...bookAny, ...dealBooked]).size, closed: leadRows.filter((l) => l.status === 'closed').length },
     definitions: {
@@ -640,26 +621,26 @@ function statsData(now, days, weeks) {
 }
 
 /* ---------- cold email: Zapmail snapshots + what the log says about email ---------- */
-function saveSnapshot(b) {
+async function saveSnapshot(b) {
   if (!b || !Array.isArray(b.mailboxes)) throw bad('A snapshot needs a mailboxes list.');
   const taken = b.taken_at ? new Date(b.taken_at) : new Date();
   if (isNaN(taken)) throw bad('Bad taken_at.');
   const payload = { ...b, taken_at: taken.toISOString() };
-  db.prepare('INSERT INTO email_snapshots(taken_at, payload) VALUES(?, ?)').run(taken.toISOString(), JSON.stringify(payload));
-  db.prepare('DELETE FROM email_snapshots WHERE id NOT IN (SELECT id FROM email_snapshots ORDER BY id DESC LIMIT 60)').run();
+  await db.run('INSERT INTO email_snapshots(taken_at, payload) VALUES(?, ?)', taken.toISOString(), JSON.stringify(payload));
+  await db.run('DELETE FROM email_snapshots WHERE id NOT IN (SELECT id FROM email_snapshots ORDER BY id DESC LIMIT 60)');
   return { ok: true, taken_at: payload.taken_at };
 }
-function emailData(now) {
-  const s = getSettings();
+async function emailData(now) {
+  const s = await getSettings();
   const tz = s.my_timezone;
   const today = Lib.dayKey(now, tz);
-  const rows = db.prepare('SELECT id, taken_at, payload FROM email_snapshots ORDER BY id DESC LIMIT 2').all();
+  const rows = await db.all('SELECT id, taken_at, payload FROM email_snapshots ORDER BY id DESC LIMIT 2');
   const snap = rows[0] ? { ...JSON.parse(rows[0].payload), id: rows[0].id, taken_at: rows[0].taken_at } : null;
   const prev = rows[1] ? JSON.parse(rows[1].payload) : null;
   const avg = (p) => (p && p.mailboxes && p.mailboxes.length ? p.mailboxes.reduce((n, m) => n + (m.score || 0), 0) / p.mailboxes.length : null);
   const fromIso = new Date(now.getTime() - 40 * 86400000).toISOString();
-  const em = db.prepare("SELECT outcome, at, mailbox FROM contacts WHERE channel = 'email' AND at >= ?").all(fromIso).map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
-  const totals = Object.fromEntries(db.prepare("SELECT outcome, COUNT(*) AS n FROM contacts WHERE channel = 'email' GROUP BY outcome").all().map((r) => [r.outcome, r.n]));
+  const em = (await db.all("SELECT outcome, \"at\", mailbox FROM contacts WHERE channel = 'email' AND \"at\" >= ?", fromIso)).map((c) => ({ ...c, day: Lib.dayKey(c.at, tz) }));
+  const totals = Object.fromEntries((await db.all("SELECT outcome, COUNT(*) AS n FROM contacts WHERE channel = 'email' GROUP BY outcome")).map((r) => [r.outcome, r.n]));
   const weekStart = Lib.addDaysKey(today, -6);
   const wk = em.filter((c) => c.day >= weekStart);
   const n7 = (o) => wk.filter((c) => c.outcome === o).length;
@@ -692,13 +673,16 @@ function emailData(now) {
 /* ---------- Zapmail API connection (read only by design) ---------- */
 /* Zapmail keys have no scopes: the same key can also buy things. So this app can only ever call the three READ endpoints below,
    it never logs or returns the key, it strips mailbox passwords and 2FA secrets before saving anything, and the key is
-   encrypted on disk with a secret that lives in a separate file, so a copied database or backup alone does not expose it. */
+   encrypted (AES-256-GCM) with a key made from the APP_SECRET environment variable. The secret lives in Vercel, the database
+   only holds the encrypted text, so a copy of the database alone does not expose the key. */
 const ZM_BASE = process.env.ZAPMAIL_BASE || 'https://api.zapmail.ai/api/v3';
 const ZM_ALLOWED = new Set(['POST /mailboxes/list', 'POST /domains', 'POST /zap-warm/scores']);
-const SECRET_FILE = path.join(DATA_DIR, '.secret');
+let keyMemo = null;
 function secretKey() {
-  if (!fs.existsSync(SECRET_FILE)) fs.writeFileSync(SECRET_FILE, crypto.randomBytes(32), { mode: 0o600 });
-  return fs.readFileSync(SECRET_FILE);
+  const s = process.env.APP_SECRET || '';
+  if (s.length < 16) throw new HttpError(503, 'APP_SECRET is not set on the server (it must be at least 16 characters). Add it in the Vercel environment variables and redeploy.');
+  if (!keyMemo || keyMemo.s !== s) keyMemo = { s, k: crypto.scryptSync(s, 'lead-tracker-zapmail-key-v1', 32) };
+  return keyMemo.k;
 }
 function encryptText(text) {
   const iv = crypto.randomBytes(12);
@@ -733,9 +717,15 @@ async function zmCall(key, method, route, body) {
 }
 
 async function zapmailSync() {
-  const enc = rawSetting('zapmail_key_enc');
+  const enc = await rawSetting('zapmail_key_enc');
   if (!enc) throw new HttpError(409, 'Zapmail is not connected.');
-  const key = decryptText(enc);
+  let key;
+  try { key = decryptText(enc); } catch (e) {
+    if (e instanceof HttpError) throw e;
+    const m = 'The saved Zapmail key cannot be read, most likely because APP_SECRET was changed. Disconnect and paste the key again.';
+    await setSetting('zapmail_last_error', m);
+    throw new HttpError(409, m);
+  }
   try {
     const boxes = [];
     for (let page = 1; page <= 20; page++) {
@@ -765,13 +755,14 @@ async function zapmailSync() {
       const j = await zmCall(key, 'POST', '/zap-warm/scores', { mailboxIds: ids });
       Object.assign(scores, (j && j.data) || {});
     }
-    const prev = db.prepare('SELECT payload FROM email_snapshots ORDER BY id DESC LIMIT 1').get();
+    const prev = await db.get('SELECT payload FROM email_snapshots ORDER BY id DESC LIMIT 1');
     const old = prev ? JSON.parse(prev.payload) : {};
     const today = new Date();
+    const myTz = (await getSettings()).my_timezone;
     const mailboxes = boxes.map((b) => {
       const sc = scores[b.id] || null;
       const startedDay = sc && sc.warmupStartedOn ? String(sc.warmupStartedOn).slice(0, 10) : null;
-      const age = startedDay ? Lib.daysBetween(startedDay, Lib.dayKey(today, getSettings().my_timezone)) : null;
+      const age = startedDay ? Lib.daysBetween(startedDay, Lib.dayKey(today, myTz)) : null;
       const status = sc ? (age != null && age >= 21 ? 'Warmed up' : 'Warming up') : b.status === 'ACTIVE' ? 'Active' : String(b.status || '').replace(/_/g, ' ').toLowerCase().replace(/^./, (c) => c.toUpperCase());
       return { id: b.id, email: b.email, name: [b.firstName, b.lastName].filter(Boolean).join(' '), domain: b.domain, status, score: sc ? sc.warmupScore : null, score_max: 100,
         sent_30d: sc ? sc.sent : null, inbox_rate: sc && sc.inboxRate != null ? sc.inboxRate / 100 : null, warmup_started: startedDay };
@@ -788,25 +779,28 @@ async function zapmailSync() {
       domains: doms.map((x) => ({ name: x.name, status: x.expectedNameServers && x.nameServers && JSON.stringify([...x.nameServers].sort()) === JSON.stringify([...x.expectedNameServers].sort()) ? 'connected' : String(x.status || 'unknown').toLowerCase(), health: x.healthLabel || null, health_score: x.healthScore != null ? Number(x.healthScore) : null, blacklisted: x.blacklisted })),
       mailboxes,
     };
-    saveSnapshot(snapshot);
-    setSetting('zapmail_last_sync', nowIso());
-    setSetting('zapmail_last_error', '');
+    await saveSnapshot(snapshot);
+    await setSetting('zapmail_last_sync', nowIso());
+    await setSetting('zapmail_last_error', '');
     return { mailboxes: mailboxes.length };
   } catch (e) {
-    setSetting('zapmail_last_error', e.message);
+    await setSetting('zapmail_last_error', e.message);
     throw e;
   }
 }
-function zapmailStatus() {
-  const enc = rawSetting('zapmail_key_enc');
-  return { connected: !!enc, key_hint: enc ? rawSetting('zapmail_key_hint') : null, last_sync: rawSetting('zapmail_last_sync') || null, last_error: rawSetting('zapmail_last_error') || null };
+async function zapmailStatus() {
+  const enc = await rawSetting('zapmail_key_enc');
+  const last = (await rawSetting('zapmail_last_sync')) || null;
+  // age is worked out here, by the server's own clock, so the page never has to guess
+  return { connected: !!enc, key_hint: enc ? await rawSetting('zapmail_key_hint') : null, last_sync: last, age_minutes: last ? Math.round((Date.now() - new Date(last).getTime()) / 60000) : null, last_error: (await rawSetting('zapmail_last_error')) || null };
 }
 
 /* ---------------- import ---------------- */
 const IMPORT_FIELDS = ['business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'external_id'];
-function importPrepare(rows, defaults) {
+async function importPrepare(rows, defaults) {
   const seen = { phone: new Map(), site: new Map(), key: new Map() };
   const out = [];
+  const normed = [];
   rows.forEach((raw, i) => {
     const input = {};
     for (const k of IMPORT_FIELDS) if (raw[k] != null && String(raw[k]).trim() !== '') input[k] = raw[k];
@@ -814,10 +808,19 @@ function importPrepare(rows, defaults) {
     if (!input.source_link && defaults.source_link) input.source_link = defaults.source_link;
     if (!input.batch && defaults.batch) input.batch = defaults.batch;
     let f;
-    try { f = normaliseLead(input, {}); } catch (e) { out.push({ i, status: 'invalid', reason: e.message, lead: input, matches: [] }); return; }
-    if (!f.business_name) { out.push({ i, status: 'invalid', reason: 'No business name', lead: input, matches: [] }); return; }
-    const matches = findDuplicates(f);
-    const optouts = findOptOutMatches(f);
+    try { f = normaliseLead(input, {}); } catch (e) { normed.push({ i, invalid: e.message, input }); return; }
+    if (!f.business_name) { normed.push({ i, invalid: 'No business name', input }); return; }
+    normed.push({ i, f });
+  });
+  const good = normed.filter((n) => n.f).map((n) => n.f);
+  const dupIdx = await loadDupIndex(good);
+  const optRows = await loadOptOutRows(good);
+  for (const n of normed) {
+    const { i } = n;
+    if (n.invalid) { out.push({ i, status: 'invalid', reason: n.invalid, lead: n.input, matches: [] }); continue; }
+    const f = n.f;
+    const matches = dupsFromIndex(f, dupIdx);
+    const optouts = optOutsFor(f, optRows);
     let status = 'new';
     let fileDup = null;
     for (const [map, key] of [[seen.phone, f.phone_norm], [seen.site, f.website_norm], [seen.key, f.name_city_key]]) {
@@ -832,11 +835,11 @@ function importPrepare(rows, defaults) {
       if (f.name_city_key && !seen.key.has(f.name_city_key)) seen.key.set(f.name_city_key, i);
     }
     out.push({ i, status, lead: f, matches, optouts, file_dup_of: fileDup });
-  });
+  }
   return out;
 }
-function importPreview(b) {
-  const rows = importPrepare(Array.isArray(b.rows) ? b.rows : [], b.defaults || {});
+async function importPreview(b) {
+  const rows = await importPrepare(Array.isArray(b.rows) ? b.rows : [], b.defaults || {});
   const counts = { new: 0, dup: 0, dup_in_file: 0, optout: 0, invalid: 0 };
   rows.forEach((r) => counts[r.status]++);
   return {
@@ -847,56 +850,58 @@ function importPreview(b) {
       optouts: (r.optouts || []).map((o) => ({ business_name: o.business_name, at: o.at })) })),
   };
 }
-function importCommit(b) {
+async function importCommit(b) {
   const mode = ['skip', 'update', 'add'].includes(b.mode) ? b.mode : 'skip';
-  const prepared = importPrepare(Array.isArray(b.rows) ? b.rows : [], b.defaults || {});
+  const prepared = await importPrepare(Array.isArray(b.rows) ? b.rows : [], b.defaults || {});
   const res = { added: 0, skipped_duplicates: 0, updated: 0, blocked_optout: 0, invalid: 0, added_ids: [] };
   const batchName = clean((b.defaults || {}).batch);
-  tx(() => {
+  await tx(async () => {
+    const toInsert = [];
     for (const r of prepared) {
       if (r.status === 'invalid') { res.invalid++; continue; }
       if (r.status === 'optout') { res.blocked_optout++; continue; }
-      if (r.status === 'new') { res.added_ids.push(insertLead({ ...r.lead, is_demo: 0 })); res.added++; continue; }
+      if (r.status === 'new') { toInsert.push({ ...r.lead, is_demo: 0 }); res.added++; continue; }
       if (r.status === 'dup_in_file') {
-        if (mode === 'add') { res.added_ids.push(insertLead(r.lead)); res.added++; } else res.skipped_duplicates++;
+        if (mode === 'add') { toInsert.push(r.lead); res.added++; } else res.skipped_duplicates++;
         continue;
       }
       if (r.status === 'dup') {
-        if (mode === 'add') { res.added_ids.push(insertLead(r.lead)); res.added++; }
+        if (mode === 'add') { toInsert.push(r.lead); res.added++; }
         else if (mode === 'update') {
-          const target = getLeadRow(r.matches[0].lead.id);
+          const target = await getLeadRow(r.matches[0].lead.id);
           const patch = {};
           for (const k of TEXT_FIELDS) if (!target[k] && r.lead[k]) patch[k] = r.lead[k];
           const merged = normaliseLead(patch, target);
-          if (Object.keys(patch).length) { writeLead(target.id, merged); res.updated++; } else res.skipped_duplicates++;
+          if (Object.keys(patch).length) { await writeLead(target.id, merged); res.updated++; } else res.skipped_duplicates++;
         } else res.skipped_duplicates++;
       }
     }
+    if (toInsert.length) res.added_ids = await insertLeads(toInsert);
   });
-  if (res.added) runBackup('import');
   res.batch = batchName;
   return res;
 }
 
 /* ---------------- export ---------------- */
-function csvLeads() {
+const BOM = '﻿';
+async function csvLeads() {
   const cols = ['id', 'business_name', 'owner_name', 'phone', 'email', 'website', 'city', 'state', 'trade', 'source', 'source_link', 'batch', 'timezone', 'notes', 'status', 'next_followup', 'competitor_checked', 'competitor_checked_date', 'opted_out', 'opt_out_date', 'opt_out_channel', 'external_id', 'is_demo', 'created_at', 'updated_at'];
-  const rows = db.prepare('SELECT * FROM leads ORDER BY id').all();
+  const rows = await db.all('SELECT * FROM leads ORDER BY id');
   return Lib.toCSV([cols, ...rows.map((r) => cols.map((c) => r[c]))]);
 }
-function csvContacts() {
+async function csvContacts() {
   const cols = ['id', 'lead_id', 'business_name', 'channel', 'outcome', 'direction', 'at', 'content', 'note', 'external_id', 'mailbox'];
-  const rows = db.prepare('SELECT c.*, l.business_name FROM contacts c JOIN leads l ON l.id = c.lead_id ORDER BY c.at').all();
+  const rows = await db.all('SELECT c.*, l.business_name FROM contacts c JOIN leads l ON l.id = c.lead_id ORDER BY c."at", c.id');
   return Lib.toCSV([cols, ...rows.map((r) => cols.map((c) => r[c]))]);
 }
-function csvDeals() {
+async function csvDeals() {
   const cols = ['lead_id', 'business_name', 'call_at', 'call_result', 'proposal_sent_date', 'deposit_paid_date', 'deposit_amount', 'signed_date', 'deal_value'];
-  const rows = db.prepare('SELECT d.*, l.business_name FROM deals d JOIN leads l ON l.id = d.lead_id ORDER BY d.lead_id').all();
+  const rows = await db.all('SELECT d.*, l.business_name FROM deals d JOIN leads l ON l.id = d.lead_id ORDER BY d.lead_id');
   return Lib.toCSV([cols, ...rows.map((r) => cols.map((c) => r[c]))]);
 }
-function csvOptOuts() {
+async function csvOptOuts() {
   const cols = ['id', 'lead_id', 'business_name', 'at', 'channel', 'note', 'removed_at', 'removed_note', 'phone_norm', 'email_norm', 'website_norm'];
-  const rows = db.prepare('SELECT * FROM opt_outs ORDER BY id').all();
+  const rows = await db.all('SELECT * FROM opt_outs ORDER BY id');
   return Lib.toCSV([cols, ...rows.map((r) => cols.map((c) => r[c]))]);
 }
 function zipFiles(files) {
@@ -925,28 +930,6 @@ function zipFiles(files) {
   return Buffer.concat([...parts, cd, end]);
 }
 
-/* ---------------- backups ---------------- */
-const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-function stamp() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
-  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
-}
-function listBackups() {
-  return fs.readdirSync(BACKUP_DIR).filter((f) => /^tracker-.*\.db$/.test(f)).sort().reverse()
-    .map((f) => ({ name: f, bytes: fs.statSync(path.join(BACKUP_DIR, f)).size, at: fs.statSync(path.join(BACKUP_DIR, f)).mtime.toISOString() }));
-}
-function runBackup(reason) {
-  let file = path.join(BACKUP_DIR, 'tracker-' + stamp() + '.db');
-  let n = 1;
-  while (fs.existsSync(file)) file = path.join(BACKUP_DIR, 'tracker-' + stamp() + '-' + n++ + '.db');
-  db.exec("VACUUM INTO '" + file.replace(/'/g, "''") + "'");
-  const all = listBackups();
-  for (const old of all.slice(60)) { try { fs.unlinkSync(path.join(BACKUP_DIR, old.name)); } catch (e) { /* ignore */ } }
-  void reason;
-  return path.basename(file);
-}
-
 /* ---------------- auth ---------------- */
 function hashPassword(pw) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -960,35 +943,49 @@ function verifyPassword(pw, stored) {
   return hb.length === c.length && crypto.timingSafeEqual(hb, c);
 }
 const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
-function newSession(res) {
+const isHttps = (req) => !!process.env.VERCEL || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https' || !!(req.socket && req.socket.encrypted);
+const cookieFlags = (req) => 'HttpOnly; SameSite=Strict; Path=/' + (isHttps(req) ? '; Secure' : '');
+async function newSession(req, res) {
   const token = crypto.randomBytes(32).toString('hex');
   const t = Date.now();
-  db.prepare('INSERT INTO sessions(token_hash, created_at, expires_at) VALUES(?,?,?)').run(sha(token), new Date(t).toISOString(), new Date(t + 30 * 86400000).toISOString());
-  res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${30 * 86400}`);
+  await db.run('INSERT INTO sessions(token_hash, created_at, expires_at) VALUES(?,?,?)', sha(token), new Date(t).toISOString(), new Date(t + 30 * 86400000).toISOString());
+  await db.run('DELETE FROM sessions WHERE expires_at < ?', new Date(t).toISOString());
+  res.setHeader('Set-Cookie', `sid=${token}; ${cookieFlags(req)}; Max-Age=${30 * 86400}`);
 }
 function cookies(req) {
   const o = {};
   for (const part of String(req.headers.cookie || '').split(';')) { const i = part.indexOf('='); if (i > 0) o[part.slice(0, i).trim()] = part.slice(i + 1).trim(); }
   return o;
 }
-function authed(req) {
+async function authed(req) {
   const t = cookies(req).sid;
   if (!t) return false;
-  const r = db.prepare('SELECT expires_at FROM sessions WHERE token_hash = ?').get(sha(t));
+  const r = await db.get('SELECT expires_at FROM sessions WHERE token_hash = ?', sha(t));
   return !!r && r.expires_at > nowIso();
 }
-const attempts = new Map();
-function throttled(ip) {
-  const now = Date.now();
-  const a = (attempts.get(ip) || []).filter((t) => now - t < 10 * 60000);
-  attempts.set(ip, a);
-  return a.length >= 6;
+/* The client address. Behind Vercel the first x-forwarded-for entry is the real visitor. Elsewhere it can be faked, so it is only trusted on Vercel. */
+function clientIp(req) {
+  if (process.env.VERCEL || process.env.TRUST_PROXY === '1') {
+    const x = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (x) return x;
+  }
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+/* Failed tries are kept in the database (not in memory), so the lock holds across serverless instances. */
+const LOCK_WINDOW_MS = 10 * 60000, LOCK_AFTER = 6;
+async function throttled(key) {
+  const r = await db.get('SELECT COUNT(*) AS n FROM login_attempts WHERE ip = ? AND at_ms > ?', key, Date.now() - LOCK_WINDOW_MS);
+  return r.n >= LOCK_AFTER;
+}
+async function noteFailure(key) {
+  await db.run('INSERT INTO login_attempts(ip, at_ms) VALUES(?, ?)', key, Date.now());
+  await db.run('DELETE FROM login_attempts WHERE at_ms < ?', Date.now() - 24 * 3600000);
 }
 
 /* ---------------- http plumbing ---------------- */
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.webmanifest': 'application/manifest+json' };
+const MAX_BODY = 4.4 * 1024 * 1024; // Vercel refuses request bodies over 4.5 MB before they reach the function
 function send(res, status, body, headers) {
-  const h = { 'Cache-Control': 'no-store', ...(headers || {}) };
+  const h = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...(headers || {}) };
   if (typeof body === 'object' && !Buffer.isBuffer(body)) { h['Content-Type'] = 'application/json; charset=utf-8'; body = JSON.stringify(body); }
   res.writeHead(status, h);
   res.end(body);
@@ -996,7 +993,7 @@ function send(res, status, body, headers) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []; let n = 0;
-    req.on('data', (c) => { n += c.length; if (n > 12 * 1024 * 1024) { reject(new HttpError(413, 'Request too large')); req.destroy(); } else chunks.push(c); });
+    req.on('data', (c) => { n += c.length; if (n > MAX_BODY) { reject(new HttpError(413, 'That file is too big to send in one go. Split it into smaller files (about 5,000 rows each).')); req.destroy(); } else chunks.push(c); });
     req.on('end', () => {
       if (!chunks.length) return resolve({});
       try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (e) { reject(bad('Body is not valid JSON.')); }
@@ -1010,86 +1007,93 @@ const route = (method, pattern, handler, opts) => routes.push({ method, re: new 
 const nowFrom = (q) => (q.now && !isNaN(new Date(q.now)) ? new Date(q.now) : new Date());
 
 /* auth routes */
-route('GET', '/api/me', (c) => ({ setup_needed: !rawSetting('password_hash'), authenticated: authed(c.req) }), { open: true });
-route('POST', '/api/setup', (c) => {
-  if (rawSetting('password_hash')) throw new HttpError(409, 'A password is already set.');
+route('GET', '/api/me', async (c) => ({ setup_needed: !(await rawSetting('password_hash')), setup_needs_code: true, authenticated: await authed(c.req) }), { open: true });
+route('POST', '/api/setup', async (c) => {
+  if (await rawSetting('password_hash')) throw new HttpError(409, 'A password is already set.');
+  const expected = process.env.SETUP_TOKEN || '';
+  if (expected.length < 8) throw new HttpError(503, 'SETUP_TOKEN is not set on the server (it must be at least 8 characters). Add it in the Vercel environment variables, redeploy, then try again.');
+  const key = 'setup|' + clientIp(c.req);
+  if (await throttled(key)) throw new HttpError(429, 'Too many tries. Wait 10 minutes.');
+  if (!safeEqual(String(c.body.setup_token || '').trim(), expected)) { await noteFailure(key); throw new HttpError(403, 'That setup code is not right.'); }
   const pw = String(c.body.password || '');
   if (pw.length < 8) throw bad('Use at least 8 characters.');
-  setSetting('password_hash', hashPassword(pw));
-  newSession(c.res);
+  // the insert only lands if no password exists yet, so two people racing cannot both set one
+  const r = await db.run("INSERT INTO settings(key, value) VALUES('password_hash', ?) ON CONFLICT(key) DO NOTHING", hashPassword(pw));
+  if (!r.changes) throw new HttpError(409, 'A password is already set.');
+  await newSession(c.req, c.res);
   return { ok: true };
 }, { open: true });
-route('POST', '/api/login', (c) => {
-  const ip = c.req.socket.remoteAddress || '';
-  if (throttled(ip)) throw new HttpError(429, 'Too many tries. Wait 10 minutes.');
-  if (!verifyPassword(String(c.body.password || ''), rawSetting('password_hash'))) {
-    attempts.set(ip, [...(attempts.get(ip) || []), Date.now()]);
+route('POST', '/api/login', async (c) => {
+  const ip = clientIp(c.req);
+  if (await throttled(ip)) throw new HttpError(429, 'Too many tries. Wait 10 minutes.');
+  if (!verifyPassword(String(c.body.password || ''), await rawSetting('password_hash'))) {
+    await noteFailure(ip);
     throw new HttpError(401, 'Wrong password.');
   }
-  newSession(c.res);
+  await newSession(c.req, c.res);
   return { ok: true };
 }, { open: true });
-route('POST', '/api/logout', (c) => {
+route('POST', '/api/logout', async (c) => {
   const t = cookies(c.req).sid;
-  if (t) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha(t));
-  c.res.setHeader('Set-Cookie', 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+  if (t) await db.run('DELETE FROM sessions WHERE token_hash = ?', sha(t));
+  c.res.setHeader('Set-Cookie', `sid=; ${cookieFlags(c.req)}; Max-Age=0`);
   return { ok: true };
 }, { open: true });
-route('POST', '/api/password', (c) => {
-  if (!verifyPassword(String(c.body.old || ''), rawSetting('password_hash'))) throw new HttpError(401, 'Current password is wrong.');
+route('POST', '/api/password', async (c) => {
+  if (!verifyPassword(String(c.body.old || ''), await rawSetting('password_hash'))) throw new HttpError(401, 'Current password is wrong.');
   const pw = String(c.body.new || '');
   if (pw.length < 8) throw bad('Use at least 8 characters.');
-  setSetting('password_hash', hashPassword(pw));
-  db.prepare('DELETE FROM sessions').run();
-  newSession(c.res);
+  await setSetting('password_hash', hashPassword(pw));
+  await db.run('DELETE FROM sessions');
+  await newSession(c.req, c.res);
   return { ok: true };
 });
 
 /* settings */
 route('GET', '/api/settings', () => getSettings());
-route('PUT', '/api/settings', (c) => {
+route('PUT', '/api/settings', async (c) => {
   for (const [k, v] of Object.entries(c.body)) {
     if (!(k in DEFAULTS)) continue;
-    if (NUMERIC.includes(k)) { const n = Number(v); if (!Number.isFinite(n) || n < 0) throw bad(k + ' must be a number.'); setSetting(k, n); }
-    else if (k === 'goal_date') { if (!isDate(v)) throw bad('Goal date must be a date.'); setSetting(k, v); }
-    else if (k === 'my_timezone') { try { Lib.parts(new Date(), v); } catch (e) { throw bad('Unknown time zone.'); } setSetting(k, v); }
-    else if (k === 'email_checklist') { try { const a = JSON.parse(v); if (!Array.isArray(a)) throw new Error('x'); setSetting(k, JSON.stringify(a)); } catch (e) { throw bad('The checklist must be a list.'); } }
-    else setSetting(k, v);
+    if (NUMERIC.includes(k)) { const n = Number(v); if (!Number.isFinite(n) || n < 0) throw bad(k + ' must be a number.'); await setSetting(k, n); }
+    else if (k === 'goal_date') { if (!isDate(v)) throw bad('Goal date must be a date.'); await setSetting(k, v); }
+    else if (k === 'my_timezone') { try { Lib.parts(new Date(), v); } catch (e) { throw bad('Unknown time zone.'); } await setSetting(k, v); }
+    else if (k === 'email_checklist') { let a; try { a = JSON.parse(v); if (!Array.isArray(a)) throw new Error('x'); } catch (e) { throw bad('The checklist must be a list.'); } await setSetting(k, JSON.stringify(a)); }
+    else await setSetting(k, v);
   }
   return getSettings();
 });
 
 /* leads */
 route('GET', '/api/leads', (c) => listLeads(c.query));
-route('GET', '/api/facets', () => ({
-  trades: db.prepare("SELECT DISTINCT trade FROM leads WHERE trade IS NOT NULL ORDER BY trade").all().map((r) => r.trade),
-  batches: db.prepare("SELECT DISTINCT batch FROM leads WHERE batch IS NOT NULL ORDER BY batch").all().map((r) => r.batch),
-  states: db.prepare("SELECT DISTINCT state FROM leads WHERE state IS NOT NULL ORDER BY state").all().map((r) => r.state),
+route('GET', '/api/facets', async () => ({
+  trades: (await db.all('SELECT DISTINCT trade FROM leads WHERE trade IS NOT NULL ORDER BY trade')).map((r) => r.trade),
+  batches: (await db.all('SELECT DISTINCT batch FROM leads WHERE batch IS NOT NULL ORDER BY batch')).map((r) => r.batch),
+  states: (await db.all('SELECT DISTINCT state FROM leads WHERE state IS NOT NULL ORDER BY state')).map((r) => r.state),
 }));
-route('POST', '/api/leads/check', (c) => {
+route('POST', '/api/leads/check', async (c) => {
   const f = normaliseLead(c.body, {});
-  return { duplicates: findDuplicates(f, Number(c.body.exclude_id) || 0), optouts: findOptOutMatches(f) };
+  return { duplicates: await findDuplicates(f, Number(c.body.exclude_id) || 0), optouts: await findOptOutMatches(f) };
 });
-route('POST', '/api/leads', (c) => {
+route('POST', '/api/leads', async (c) => {
   const f = normaliseLead(c.body, { source: 'other', status: 'new' });
   if (!f.business_name) throw bad('Business name is required.');
   if (!f.source) f.source = 'other';
-  const dups = findDuplicates(f);
-  const opts = findOptOutMatches(f);
+  const dups = await findDuplicates(f);
+  const opts = await findOptOutMatches(f);
   if ((dups.length || opts.length) && !c.body.force) throw new HttpError(409, 'Possible duplicate', { duplicates: dups, optouts: opts });
   if (opts.length) { f.opted_out = 1; f.opt_out_date = nowIso(); f.opt_out_channel = 'all'; }
-  const id = tx(() => {
-    const newId = insertLead(f);
-    if (opts.length) db.prepare('INSERT INTO opt_outs(lead_id, business_name, phone_norm, email_norm, website_norm, name_city_key, at, channel, note) VALUES(?,?,?,?,?,?,?,?,?)')
-      .run(newId, f.business_name, f.phone_norm, f.email_norm, f.website_norm, f.name_city_key, nowIso(), 'all', 'Matched an earlier opt-out when added');
+  const id = await tx(async () => {
+    const newId = await insertLead(f);
+    if (opts.length) await db.run('INSERT INTO opt_outs(lead_id, business_name, phone_norm, email_norm, website_norm, name_city_key, "at", channel, note) VALUES(?,?,?,?,?,?,?,?,?)',
+      newId, f.business_name, f.phone_norm, f.email_norm, f.website_norm, f.name_city_key, nowIso(), 'all', 'Matched an earlier opt-out when added');
     return newId;
   });
-  return { ...leadDetail(id), flagged_optout: opts.length > 0 };
+  return { ...(await leadDetail(id)), flagged_optout: opts.length > 0 };
 });
 route('GET', '/api/leads/:id', (c) => leadDetail(Number(c.params.id)));
-route('PATCH', '/api/leads/:id', (c) => {
+route('PATCH', '/api/leads/:id', async (c) => {
   const id = Number(c.params.id);
-  const cur = getLeadRow(id);
+  const cur = await getLeadRow(id);
   if (!cur) throw new HttpError(404, 'Lead not found');
   const body = { ...c.body };
   delete body.opted_out; delete body.opt_out_date; delete body.opt_out_channel; // only via the opt-out endpoints
@@ -1097,21 +1101,21 @@ route('PATCH', '/api/leads/:id', (c) => {
   const f = normaliseLead(body, cur);
   if (!f.business_name) throw bad('Business name is required.');
   if (!f.source) f.source = 'other';
-  writeLead(id, f);
+  await writeLead(id, f);
   return leadDetail(id);
 });
-route('DELETE', '/api/leads/:id', (c) => {
+route('DELETE', '/api/leads/:id', async (c) => {
   const id = Number(c.params.id);
-  const cur = getLeadRow(id);
+  const cur = await getLeadRow(id);
   if (!cur) throw new HttpError(404, 'Lead not found');
   if (cur.opted_out && c.query.confirm !== cur.business_name) throw bad('This lead is opted out. Type the business name to delete it. The opt-out record is kept.');
   if (!cur.opted_out && c.query.confirm !== '1' && c.query.confirm !== cur.business_name) throw bad('Confirm the delete.');
-  db.prepare('DELETE FROM leads WHERE id = ?').run(id);
+  await db.run('DELETE FROM leads WHERE id = ?', id);
   return { ok: true };
 });
-route('POST', '/api/leads/:id/contacts', (c) => addContact(Number(c.params.id), c.body, nowFrom(c.query)));
-route('PATCH', '/api/contacts/:id', (c) => {
-  const cur = db.prepare('SELECT * FROM contacts WHERE id = ?').get(Number(c.params.id));
+route('POST', '/api/leads/:id/contacts', async (c) => addContact(Number(c.params.id), c.body, nowFrom(c.query)));
+route('PATCH', '/api/contacts/:id', async (c) => {
+  const cur = await db.get('SELECT * FROM contacts WHERE id = ?', Number(c.params.id));
   if (!cur) throw new HttpError(404, 'Entry not found');
   const content = 'content' in c.body ? clean(c.body.content) : cur.content;
   const note = 'note' in c.body ? clean(c.body.note) : cur.note;
@@ -1119,13 +1123,13 @@ route('PATCH', '/api/contacts/:id', (c) => {
   if (c.body.at) { const d = new Date(c.body.at); if (isNaN(d)) throw bad('Bad date/time.'); at = d.toISOString(); }
   const outcome = c.body.outcome || cur.outcome;
   if (!Lib.OUTCOMES[cur.channel].includes(outcome)) throw bad('Outcome not valid for this channel.');
-  db.prepare('UPDATE contacts SET content=?, note=?, at=?, outcome=? WHERE id=?').run(content, note, at, outcome, cur.id);
+  await db.run('UPDATE contacts SET content = ?, note = ?, "at" = ?, outcome = ? WHERE id = ?', content, note, at, outcome, cur.id);
   return leadDetail(cur.lead_id);
 });
-route('DELETE', '/api/contacts/:id', (c) => {
-  const cur = db.prepare('SELECT * FROM contacts WHERE id = ?').get(Number(c.params.id));
+route('DELETE', '/api/contacts/:id', async (c) => {
+  const cur = await db.get('SELECT * FROM contacts WHERE id = ?', Number(c.params.id));
   if (!cur) throw new HttpError(404, 'Entry not found');
-  db.prepare('DELETE FROM contacts WHERE id = ?').run(cur.id);
+  await db.run('DELETE FROM contacts WHERE id = ?', cur.id);
   return leadDetail(cur.lead_id);
 });
 route('POST', '/api/leads/:id/optout', (c) => optOut(Number(c.params.id), c.body));
@@ -1136,23 +1140,23 @@ route('PUT', '/api/leads/:id/deal', (c) => putDeal(Number(c.params.id), c.body))
 route('GET', '/api/today', (c) => todayData(nowFrom(c.query), c.query.follow_limit));
 route('GET', '/api/followups', (c) => followupsData(nowFrom(c.query), c.query));
 route('GET', '/api/calls', (c) => callsData(nowFrom(c.query), c.query.period, c.query.ready_limit));
-route('GET', '/api/outreach/day', (c) => outreachDay(c.query.day || Lib.dayKey(nowFrom(c.query), getSettings().my_timezone), nowFrom(c.query)));
+route('GET', '/api/outreach/day', async (c) => outreachDay(c.query.day || Lib.dayKey(nowFrom(c.query), (await getSettings()).my_timezone), nowFrom(c.query)));
 route('PUT', '/api/outreach/day', (c) => setOutreach(c.body, nowFrom(c.query)));
-route('GET', '/api/calls/day', (c) => dayData(c.query.day || Lib.dayKey(nowFrom(c.query), getSettings().my_timezone), nowFrom(c.query)));
+route('GET', '/api/calls/day', async (c) => dayData(c.query.day || Lib.dayKey(nowFrom(c.query), (await getSettings()).my_timezone), nowFrom(c.query)));
 route('PUT', '/api/calls/day', (c) => setDay(c.body, nowFrom(c.query)));
 route('GET', '/api/calls/history', (c) => dayHistory(nowFrom(c.query)));
 route('GET', '/api/stats', (c) => statsData(nowFrom(c.query), Math.min(Number(c.query.days) || 14, 90), Math.min(Number(c.query.weeks) || 8, 26)));
-route('GET', '/api/pipeline', (c) => {
+route('GET', '/api/pipeline', async (c) => {
   const now = nowFrom(c.query);
-  const rows = db.prepare(`SELECT l.id, l.business_name, l.owner_name, l.city, l.state, l.trade, l.status, l.next_followup, l.opted_out, d.deal_value, d.call_at, d.signed_date
-    FROM leads l LEFT JOIN deals d ON d.lead_id = l.id ORDER BY (l.next_followup IS NULL), l.next_followup, l.id`).all();
+  const rows = await db.all(`SELECT l.id, l.business_name, l.owner_name, l.city, l.state, l.trade, l.status, l.next_followup, l.opted_out, d.deal_value, d.call_at, d.signed_date
+    FROM leads l LEFT JOIN deals d ON d.lead_id = l.id ORDER BY (l.next_followup IS NULL), l.next_followup, l.id`);
   const columns = Object.fromEntries(Lib.BOARD.map((st) => [st, []]));
   const counts = Object.fromEntries(Lib.STATUSES.map((st) => [st, 0]));
   for (const r of rows) {
     counts[r.status]++;
     if (columns[r.status] && columns[r.status].length < 80) columns[r.status].push({ ...r, opted_out: !!r.opted_out });
   }
-  return { board: Lib.BOARD, columns, counts, goal: goalData(now), today: Lib.dayKey(now, getSettings().my_timezone) };
+  return { board: Lib.BOARD, columns, counts, goal: await goalData(now), today: Lib.dayKey(now, (await getSettings()).my_timezone) };
 });
 
 route('GET', '/api/email', (c) => emailData(nowFrom(c.query)));
@@ -1161,49 +1165,63 @@ route('GET', '/api/zapmail/status', () => zapmailStatus());
 route('PUT', '/api/zapmail/key', async (c) => {
   const key = String(c.body.key || '').trim();
   if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(key)) throw bad('That does not look like a Zapmail key. It is 36 characters with dashes, like 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed.');
-  setSetting('zapmail_key_enc', encryptText(key));
-  setSetting('zapmail_key_hint', key.slice(-4));
-  try { const r = await zapmailSync(); return { ...zapmailStatus(), synced: true, mailboxes: r.mailboxes }; } catch (e) {
-    if (e.zm === 'bad_key') { setSetting('zapmail_key_enc', ''); setSetting('zapmail_key_hint', ''); }
+  await setSetting('zapmail_key_enc', encryptText(key));
+  await setSetting('zapmail_key_hint', key.slice(-4));
+  try { const r = await zapmailSync(); return { ...(await zapmailStatus()), synced: true, mailboxes: r.mailboxes }; } catch (e) {
+    if (e.zm === 'bad_key') { await setSetting('zapmail_key_enc', ''); await setSetting('zapmail_key_hint', ''); }
     throw e;
   }
 });
-route('DELETE', '/api/zapmail/key', () => { setSetting('zapmail_key_enc', ''); setSetting('zapmail_key_hint', ''); setSetting('zapmail_last_error', ''); return zapmailStatus(); });
-route('POST', '/api/zapmail/sync', async () => { const r = await zapmailSync(); return { ...zapmailStatus(), synced: true, mailboxes: r.mailboxes }; });
+route('DELETE', '/api/zapmail/key', async () => { await setSetting('zapmail_key_enc', ''); await setSetting('zapmail_key_hint', ''); await setSetting('zapmail_last_error', ''); return zapmailStatus(); });
+route('POST', '/api/zapmail/sync', async () => { const r = await zapmailSync(); return { ...(await zapmailStatus()), synced: true, mailboxes: r.mailboxes }; });
 
-/* import / export / backups */
+/* The once-a-day refresh. Vercel Cron calls this with "Authorization: Bearer <CRON_SECRET>". It has no login, so the secret is the only way in. */
+route('GET', '/api/cron/zapmail', async (c) => {
+  const secret = process.env.CRON_SECRET || '';
+  if (secret.length < 16) throw new HttpError(503, 'CRON_SECRET is not set on the server (at least 16 characters).');
+  const m = /^Bearer (.+)$/.exec(String(c.req.headers.authorization || ''));
+  if (!m || !safeEqual(m[1], secret)) throw new HttpError(401, 'Not allowed');
+  await db.run('DELETE FROM sessions WHERE expires_at < ?', nowIso());
+  await db.run('DELETE FROM login_attempts WHERE at_ms < ?', Date.now() - 24 * 3600000);
+  if (!(await rawSetting('zapmail_key_enc'))) return { ok: true, synced: false, reason: 'Zapmail is not connected' };
+  const r = await zapmailSync();
+  return { ok: true, synced: true, mailboxes: r.mailboxes };
+}, { open: true });
+
+/* import / export */
 route('POST', '/api/import/preview', (c) => importPreview(c.body));
 route('POST', '/api/import/commit', (c) => importCommit(c.body));
-route('GET', '/api/export/:name', (c, req, res) => {
+route('GET', '/api/export/:name', async (c, req, res) => {
   const n = c.params.name;
   const map = { 'leads.csv': csvLeads, 'contacts.csv': csvContacts, 'deals.csv': csvDeals, 'opt_outs.csv': csvOptOuts };
   if (n === 'all.zip') {
-    const files = Object.entries(map).map(([name, fn]) => ({ name, data: Buffer.from('﻿' + fn(), 'utf8') }));
+    const files = [];
+    for (const [name, fn] of Object.entries(map)) files.push({ name, data: Buffer.from(BOM + (await fn()), 'utf8') });
     send(res, 200, zipFiles(files), { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="lead-tracker-export.zip"' });
     return null;
   }
   if (!map[n]) throw new HttpError(404, 'Unknown export');
-  send(res, 200, Buffer.from('﻿' + map[n](), 'utf8'), { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${n}"` });
+  send(res, 200, Buffer.from(BOM + (await map[n]()), 'utf8'), { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${n}"` });
   return null;
 });
-route('GET', '/api/backups', () => ({ backups: listBackups() }));
-route('POST', '/api/backups/run', () => ({ name: runBackup('manual'), backups: listBackups() }));
-route('POST', '/api/demo/clear', (c) => {
+route('POST', '/api/demo/clear', async (c) => {
   if (c.body.confirm !== 'DELETE DEMO') throw bad('Type DELETE DEMO to confirm.');
-  const r = db.prepare('DELETE FROM leads WHERE is_demo = 1').run();
-  db.prepare('DELETE FROM opt_outs WHERE lead_id NOT IN (SELECT id FROM leads) AND business_name IN (SELECT business_name FROM opt_outs WHERE 0)').run();
-  return { deleted: Number(r.changes) };
+  const r = await db.run('DELETE FROM leads WHERE is_demo = 1');
+  return { deleted: r.changes };
 });
-route('GET', '/api/health', () => ({ ok: true, time: nowIso() }), { open: true });
+route('GET', '/api/health', async (c) => {
+  if (c.query.db === '1') await db.get('SELECT 1 AS ok');
+  return { ok: true, time: nowIso() };
+}, { open: true });
 
-/* ---------------- server ---------------- */
+/* ---------------- request handler ---------------- */
 async function handleApi(req, res, url) {
   const q = Object.fromEntries(url.searchParams);
   for (const r of routes) {
     if (r.method !== req.method) continue;
     const m = r.re.exec(url.pathname);
     if (!m) continue;
-    if (!r.open && !authed(req)) return send(res, 401, { error: 'Not signed in' });
+    if (!r.open && !(await authed(req))) return send(res, 401, { error: 'Not signed in' });
     if (req.method !== 'GET') {
       const origin = req.headers.origin;
       if (origin) { let host = ''; try { host = new URL(origin).host; } catch (e) { /* ignore */ } if (host !== req.headers.host) return send(res, 403, { error: 'Bad origin' }); }
@@ -1215,38 +1233,41 @@ async function handleApi(req, res, url) {
   }
   return send(res, 404, { error: 'Not found' });
 }
-function serveStatic(req, res, url) {
-  let p = decodeURIComponent(url.pathname);
-  if (p === '/') p = '/index.html';
-  const file = path.normalize(path.join(PUBLIC_DIR, p));
-  if (!file.startsWith(PUBLIC_DIR)) return send(res, 403, 'Forbidden');
-  fs.readFile(file, (err, data) => {
-    if (err) return send(res, 404, 'Not found', { 'Content-Type': 'text/plain' });
-    send(res, 200, data, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
-  });
-  return undefined;
-}
-const server = http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, 'http://x');
-    if (url.pathname.startsWith('/api/')) await handleApi(req, res, url);
-    else serveStatic(req, res, url);
-  } catch (e) {
-    const status = e.status || 500;
-    if (status === 500) console.error(e);
-    if (!res.headersSent) send(res, status, { error: e.message || 'Server error', ...(e.extra || {}) });
-  }
-});
 
-function start() {
-  const last = listBackups()[0];
-  if (!last || Date.now() - new Date(last.at).getTime() > 3600000) { try { runBackup('start'); } catch (e) { console.error('backup failed', e.message); } }
-  const t = setInterval(() => { try { runBackup('auto'); } catch (e) { console.error('backup failed', e.message); } }, 3 * 3600000);
-  t.unref();
-  const zt = setInterval(() => { if (rawSetting('zapmail_key_enc')) zapmailSync().catch(() => { /* the error is saved and shown on the Email page */ }); }, 3 * 3600000);
-  zt.unref();
-  if (rawSetting('zapmail_key_enc')) zapmailSync().catch(() => { /* shown on the Email page */ });
-  server.listen(PORT, HOST, () => console.log(`Lead Tracker running at http://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}  (data: ${DATA_DIR})`));
+const DB_DOWN = /^(ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|28P01|28000|3D000|08|57P|53300)/;
+function describeError(e) {
+  if (e instanceof HttpError) return { status: e.status, body: { error: e.message, ...(e.extra || {}) } };
+  if (e instanceof db.DbConfigError) return { status: 503, body: { error: e.message } };
+  if (e && (DB_DOWN.test(String(e.code || '')) || /timeout exceeded when trying to connect|Connection terminated|password authentication failed/i.test(String(e.message)))) {
+    console.error('database connection problem:', e.code || '', e.message);
+    return { status: 503, body: { error: 'Cannot reach the database. Check DATABASE_URL in the Vercel settings (Transaction pooler string, with the right password).' } };
+  }
+  console.error(e);
+  return { status: 500, body: { error: 'Something went wrong on the server. Try again.' } };
 }
-if (require.main === module) start();
-module.exports = { server, db, start, runBackup, saveSnapshot, normaliseLead, insertLead, addContact, optOut, putDeal, getSettings, setSetting, PORT, HOST, DATA_DIR };
+
+/* (req, res) handler for everything under /api/ */
+function handler(req, res) {
+  return db.withRequest(async () => {
+    try {
+      const url = new URL(req.url, 'http://x');
+      if (!url.pathname.startsWith('/api/')) return send(res, 404, { error: 'Not found' });
+      await db.ensureAlive();
+      await ensureSchema();
+      await handleApi(req, res, url);
+    } catch (e) {
+      const { status, body } = describeError(e);
+      if (!res.headersSent) send(res, status, body);
+    }
+    return undefined;
+  });
+}
+
+/* Make sure the tables exist. Scripts and tests call this; the handler calls it by itself. */
+const init = () => ensureSchema();
+
+module.exports = {
+  handler, init, db, Lib, HttpError,
+  importPreview, importCommit, saveSnapshot, normaliseLead, insertLead, insertLeads, addContact, optOut, putDeal, getSettings, setSetting, zapmailSync,
+  send,
+};

@@ -1,20 +1,25 @@
 'use strict';
-/* End to end API test. Starts the server on a throwaway database, seeds it, and walks the whole flow.
-   Run: node --no-warnings test/flow.js */
-const { spawn, spawnSync } = require('node:child_process');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
+/* End to end API test. Runs the app against an in-process Postgres (PGlite, a WebAssembly build of real Postgres),
+   seeds it, and walks the whole flow over real HTTP. Nothing outside this process is touched.
+   Run: node --no-warnings test/flow.js
+   Also run it with TEST_VIA_PG=1 to go through the production database path (the pg package over a real Postgres connection). */
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const { DatabaseSync } = require('node:sqlite');
-const Lib = require('../public/lib.js');
 
-const ROOT = path.join(__dirname, '..');
 const PORT = 4399;
 const BASE = 'http://127.0.0.1:' + PORT;
-const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-test-'));
 const PW = 'test-' + crypto.randomBytes(6).toString('hex');
+const SETUP_TOKEN = 'setup-' + crypto.randomBytes(6).toString('hex');
+const APP_SECRET = 'app-secret-' + crypto.randomBytes(16).toString('hex');
+const CRON_SECRET = 'cron-secret-' + crypto.randomBytes(16).toString('hex');
+// the same settings Vercel would hold as environment variables
+delete process.env.DATABASE_URL;
+Object.assign(process.env, { TEST_PGLITE: '1', APP_SECRET, SETUP_TOKEN, CRON_SECRET, ZAPMAIL_BASE: 'http://127.0.0.1:4397/api/v3' });
+const Lib = require('../public/lib.js');
+const { createServer, app } = require('../dev-server.js');
+const { seed } = require('../seed.js');
+const { resetSchemaFlag } = require('../src/schema.js');
+const db = app.db;
 let cookie = '';
 const results = [];
 function check(name, cond, extra) { results.push({ name, ok: !!cond, extra }); console.log((cond ? 'PASS ' : 'FAIL ') + name + (cond ? '' : '  <-- ' + JSON.stringify(extra))); }
@@ -48,28 +53,68 @@ function readZip(buf) {
   return files;
 }
 
+let pgServer = null; // set when running through the production path (TEST_VIA_PG=1)
+
+/* Everything the database holds, as text, for "is this secret anywhere in it" checks. */
+async function wholeDatabaseText() {
+  let out = '';
+  const tables = (await db.all("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")).map((t) => t.tablename);
+  for (const t of tables) out += JSON.stringify(await db.all('SELECT * FROM ' + t)) + '\n';
+  const lite = db.raw().lite || (pgServer && pgServer.lite);
+  const dump = await lite.dumpDataDir('none'); // the raw files of the database, like reading tracker.db used to
+  out += Buffer.from(await dump.arrayBuffer()).toString('latin1');
+  return out;
+}
+
 (async () => {
-  // seed first, then start the server on the same data
-  const seed = spawnSync(process.execPath, ['--no-warnings', 'seed.js'], { cwd: ROOT, env: { ...process.env, DATA_DIR: DATA }, encoding: 'utf8' });
-  check('seed script runs', seed.status === 0, seed.stderr);
-  { const d0 = new DatabaseSync(path.join(DATA, 'tracker.db')); d0.exec("UPDATE leads SET status = 'contacted' WHERE business_name = 'Ridgeline Roofing'"); d0.close(); }
+  if (process.env.TEST_VIA_PG === '1') {
+    pgServer = await require('./pg-server.js').startPgServer(5439);
+    delete process.env.TEST_PGLITE;
+    process.env.DATABASE_URL = pgServer.url;
+    process.env.DATABASE_SSL = 'off';
+    console.log('Running through the production database path: pg package -> ' + pgServer.url.replace(/:[^:@]*@/, ':***@'));
+  }
+  // seed first, then start the server on the same database
+  const seeded = await seed().catch((e) => ({ error: e.stack }));
+  check('seed script runs', seeded.added === 10, seeded);
+  check('the database engine is the one this run is meant to test (' + (pgServer ? 'pg, the production path' : 'PGlite') + ')', db.kind() === (pgServer ? 'pg' : 'pglite'), db.kind());
+  await db.run("UPDATE leads SET status = 'contacted' WHERE business_name = 'Ridgeline Roofing'");
+  resetSchemaFlag(); // like a fresh server instance starting: the tables check and the old-status fix run again
   const ZM_KEY = '1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed';
   const mock = await require('./zapmail-mock.js').startMock(4397, ZM_KEY);
-  const srv = spawn(process.execPath, ['--no-warnings', 'server.js'], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DATA_DIR: DATA, ZAPMAIL_BASE: 'http://127.0.0.1:4397/api/v3' }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let srvErr = '';
-  srv.stderr.on('data', (d) => { srvErr += d; });
-  for (let i = 0; i < 40; i++) { try { const r = await fetch(BASE + '/api/health'); if (r.ok) break; } catch (e) { /* not up yet */ } await sleep(150); }
+  const srv = createServer();
+  await new Promise((resolve) => srv.listen(PORT, '127.0.0.1', resolve));
+  // the Vercel entry file, served the way Vercel calls it: a plain (req, res) function
+  const vercelStyle = require('node:http').createServer(require('../api/index.js'));
+  await new Promise((resolve) => vercelStyle.listen(PORT + 10, '127.0.0.1', resolve));
 
   try {
+    /* ---------- the Vercel function entry ---------- */
+    const v1 = await fetch('http://127.0.0.1:' + (PORT + 10) + '/api/me');
+    const v2 = await fetch('http://127.0.0.1:' + (PORT + 10) + '/index.html');
+    check('api/index.js answers API calls as a plain (req, res) function, and only API calls', v1.status === 200 && (await v1.json()).setup_needed === true && v2.status === 404, [v1.status, v2.status]);
+
     /* ---------- auth ---------- */
     let r = await call('GET', '/api/me', null, { noCookie: true });
-    check('first run asks to set a password', r.json && r.json.setup_needed === true && r.json.authenticated === false, r.json);
+    check('first run asks to set a password', r.json && r.json.setup_needed === true && r.json.authenticated === false && r.json.setup_needs_code === true, r.json);
     r = await call('GET', '/api/leads', null, { noCookie: true });
     check('API is closed without a session', r.status === 401, r.status);
-    r = await call('POST', '/api/setup', { password: 'short' }, { noCookie: true });
-    check('short password rejected', r.status === 400, r.status);
     r = await call('POST', '/api/setup', { password: PW }, { noCookie: true });
+    check('first-run setup is refused without the setup code', r.status === 403 && !cookie, r.status);
+    r = await call('POST', '/api/setup', { password: PW, setup_token: 'not-the-code' }, { noCookie: true });
+    check('first-run setup is refused with a wrong setup code', r.status === 403 && !cookie, r.status);
+    check('nothing was set by the refused attempts', (await call('GET', '/api/me', null, { noCookie: true })).json.setup_needed === true, 1);
+    delete process.env.SETUP_TOKEN;
+    r = await call('POST', '/api/setup', { password: PW, setup_token: SETUP_TOKEN }, { noCookie: true });
+    process.env.SETUP_TOKEN = SETUP_TOKEN;
+    check('if SETUP_TOKEN is not configured on the server, setup is refused outright', r.status === 503, r.status);
+    r = await call('POST', '/api/setup', { password: 'short', setup_token: SETUP_TOKEN }, { noCookie: true });
+    check('short password rejected', r.status === 400, r.status);
+    r = await call('POST', '/api/setup', { password: PW, setup_token: SETUP_TOKEN }, { noCookie: true });
     check('password set and signed in', r.status === 200 && cookie.startsWith('sid='), r.status);
+    r = await call('POST', '/api/setup', { password: 'another-password-1', setup_token: SETUP_TOKEN }, { noCookie: true });
+    check('once a password exists the setup path is closed, even with the right code', r.status === 409, r.status);
+    check('the password is stored hashed, never as typed', !(await wholeDatabaseText()).includes(PW), 1);
     r = await call('POST', '/api/leads', { business_name: 'Evil' }, { headers: { Origin: 'http://evil.example' } });
     check('cross-site POST is refused', r.status === 403, r.status);
     r = await call('GET', '/../server.js', null, { noCookie: true });
@@ -335,11 +380,22 @@ function readZip(buf) {
     check('zapmail: plan, trial dates and warm-up settings are carried over from the last snapshot', zem.snapshot.plan.name === 'Starter' && zem.snapshot.zapwarm.free_trial_ends === '2026-12-23' && zem.snapshot.zapwarm.daily_emails === 5, [zem.snapshot.plan, zem.snapshot.zapwarm]);
     const wholePage = JSON.stringify(zem) + JSON.stringify((await call('GET', '/api/zapmail/status')).json) + JSON.stringify((await call('GET', '/api/settings')).json);
     check('zapmail: no password, app password, 2FA secret or key appears in anything the app returns', !/SECRET(PW|APP|2FA)/.test(wholePage) && !wholePage.includes(ZM_KEY) && !wholePage.includes('x-auth'), 1);
-    const dbBytes = fs.readFileSync(path.join(DATA, 'tracker.db')).toString('latin1') + (fs.existsSync(path.join(DATA, 'tracker.db-wal')) ? fs.readFileSync(path.join(DATA, 'tracker.db-wal')).toString('latin1') : '');
-    check('zapmail: the database file holds no mailbox password or 2FA secret', !/SECRETPW|SECRETAPP|SECRET2FA/.test(dbBytes), 1);
-    check('zapmail: the key is stored encrypted, not as plain text', !dbBytes.includes(ZM_KEY) && fs.existsSync(path.join(DATA, '.secret')), 1);
-    const bkp = (await call('POST', '/api/backups/run')).json.name;
-    check('zapmail: a backup copy does not contain the key either', !fs.readFileSync(path.join(DATA, 'backups', bkp)).toString('latin1').includes(ZM_KEY), 1);
+    const dbBytes = await wholeDatabaseText();
+    check('zapmail: the database holds no mailbox password or 2FA secret', !/SECRETPW|SECRETAPP|SECRET2FA/.test(dbBytes), 1);
+    check('zapmail: the key is stored encrypted, not as plain text', !dbBytes.includes(ZM_KEY) && !dbBytes.includes(Buffer.from(ZM_KEY).toString('base64')), 1);
+    const encRow = (await db.get("SELECT value FROM settings WHERE key = 'zapmail_key_enc'")).value;
+    check('zapmail: the stored text is AES-GCM (12 byte nonce + 16 byte tag + the key), made with APP_SECRET', Buffer.from(encRow, 'base64').length === 12 + 16 + ZM_KEY.length, encRow.length);
+    const zipNow = (await call('GET', '/api/export/all.zip')).buf.toString('latin1');
+    check('zapmail: the export zip does not contain the key either', !zipNow.includes(ZM_KEY) && !/SECRETPW|SECRETAPP|SECRET2FA/.test(zipNow), 1);
+    process.env.APP_SECRET = 'a-completely-different-secret-1234567890';
+    r = await call('POST', '/api/zapmail/sync');
+    check('zapmail: with a different APP_SECRET the saved key cannot be opened, and the message says what to do', r.status === 409 && /APP_SECRET/.test(r.json.error) && /paste the key again/.test(r.json.error), r.json);
+    process.env.APP_SECRET = APP_SECRET;
+    check('zapmail: with the right APP_SECRET it opens again', (await call('POST', '/api/zapmail/sync')).status === 200, 1);
+    delete process.env.APP_SECRET;
+    r = await call('PUT', '/api/zapmail/key', { key: ZM_KEY });
+    check('zapmail: with no APP_SECRET on the server a key is refused, not stored in the clear', r.status === 503 && /APP_SECRET/.test(r.json.error), r.json);
+    process.env.APP_SECRET = APP_SECRET;
     const priorCount = (await call('GET', '/api/email')).json.snapshot.mailboxes.length;
     mock.state.mode = 'not_enabled';
     r = await call('POST', '/api/zapmail/sync');
@@ -351,9 +407,26 @@ function readZip(buf) {
     r = await call('POST', '/api/zapmail/sync');
     check('zapmail: Refresh now works again and clears the error', r.status === 200 && (await call('GET', '/api/zapmail/status')).json.last_error === null, r.json);
     check('zapmail: each sync adds a snapshot, so score history builds', (await call('GET', '/api/email')).json.score_before != null, 1);
+
+    /* ---------- the once-a-day Vercel cron ---------- */
+    r = await call('GET', '/api/cron/zapmail', null, { noCookie: true });
+    check('cron: no secret, no entry (401)', r.status === 401, r.status);
+    r = await call('GET', '/api/cron/zapmail', null, { noCookie: true, headers: { Authorization: 'Bearer wrong-secret-wrong-secret' } });
+    check('cron: a wrong secret is refused (401)', r.status === 401, r.status);
+    r = await call('GET', '/api/cron/zapmail', null, { headers: { Authorization: 'Bearer ' + SETUP_TOKEN } });
+    check('cron: the setup code or a login cookie does not open it, only CRON_SECRET', r.status === 401, r.status);
+    const snapsBefore = (await db.get('SELECT COUNT(*) AS n FROM email_snapshots')).n;
+    r = await call('GET', '/api/cron/zapmail', null, { noCookie: true, headers: { Authorization: 'Bearer ' + CRON_SECRET } });
+    check('cron: with CRON_SECRET it refreshes Zapmail and adds a snapshot', r.status === 200 && r.json.synced === true && r.json.mailboxes === 3 && (await db.get('SELECT COUNT(*) AS n FROM email_snapshots')).n === Math.min(60, snapsBefore + 1), [r.status, r.json]);
+    delete process.env.CRON_SECRET;
+    r = await call('GET', '/api/cron/zapmail', null, { noCookie: true, headers: { Authorization: 'Bearer ' } });
+    check('cron: with no CRON_SECRET configured the route stays shut', r.status === 503, r.status);
+    process.env.CRON_SECRET = CRON_SECRET;
     r = await call('DELETE', '/api/zapmail/key');
     check('zapmail: disconnecting deletes the key', r.json.connected === false && (await call('POST', '/api/zapmail/sync')).status === 409, r.json);
-    const afterDelete = fs.readFileSync(path.join(DATA, 'tracker.db')).toString('latin1');
+    r = await call('GET', '/api/cron/zapmail', null, { noCookie: true, headers: { Authorization: 'Bearer ' + CRON_SECRET } });
+    check('cron: with Zapmail disconnected it does nothing and says so', r.status === 200 && r.json.synced === false, r.json);
+    const afterDelete = await wholeDatabaseText();
     check('zapmail: the last numbers stay on the Email page after disconnecting', (await call('GET', '/api/email')).json.snapshot.mailboxes.length === 3 && !afterDelete.includes(ZM_KEY), 1);
     void beforeSnap;
 
@@ -397,12 +470,23 @@ function readZip(buf) {
     check('exported contacts include the timeline text', zip['contacts.csv'].data.toString('utf8').includes('Yes send it') || zip['contacts.csv'].data.toString('utf8').includes('Opener'), 1);
     check('exported opt-outs keep the deleted lead record', zip['opt_outs.csv'].data.toString('utf8').includes('Maple Street Roofing'), 1);
     r = await call('POST', '/api/backups/run');
-    check('manual backup is written', r.status === 200 && r.json.backups.length >= 1, r.json);
-    const bk = path.join(DATA, 'backups', r.json.name);
-    const bdb = new DatabaseSync(bk, { readOnly: true });
+    check('the local backup feature is gone (Supabase keeps the backups, Export is your own copy)', r.status === 404 && (await call('GET', '/api/backups')).status === 404, r.status);
     const liveCount = (await call('GET', '/api/leads?limit=1')).json.total;
-    check('backup file opens and holds the same number of leads', bdb.prepare('SELECT COUNT(*) AS n FROM leads').get().n === liveCount, liveCount);
-    bdb.close();
+    const csvRows = Lib.parseCSV((await call('GET', '/api/export/leads.csv')).buf.toString('utf8'));
+    check('the leads CSV export holds every lead (header + one row each)', csvRows.filter((x) => x.length > 1).length === liveCount + 1, [csvRows.length, liveCount]);
+    const exportedBack = csvRows.slice(1).find((x) => x[1] === 'Ridgeline Roofing');
+    check('the exported CSV can be read back by the Import page rules (name, phone and city are there)', exportedBack && exportedBack[3] === '(615) 555-0142' && exportedBack[6] === 'Nashville', exportedBack);
+
+    /* ---------- Row Level Security: the public anon key must see nothing ---------- */
+    const rls = await db.all("SELECT c.relname, c.relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY c.relname");
+    const policies = await db.all("SELECT * FROM pg_policies WHERE schemaname = 'public'");
+    check('Row Level Security is on for every table the app made', rls.length >= 11 && rls.every((t) => t.relrowsecurity === true), rls);
+    check('and no policies exist, so no outside role can read or write anything', policies.length === 0, policies);
+    await db.exec('ALTER TABLE call_tally DISABLE ROW LEVEL SECURITY');
+    resetSchemaFlag();
+    await app.init();
+    check('if Row Level Security was ever switched off, the next start switches it back on', (await db.get("SELECT relrowsecurity FROM pg_class WHERE relname = 'call_tally' AND relkind = 'r'")).relrowsecurity === true, 1);
+    check('every table is one of the known ones (nothing unprotected slipped in)', rls.map((t) => t.relname).sort().join() === require('../src/schema.js').TABLES.slice().sort().join(), rls.map((t) => t.relname));
 
     /* ---------- password change, logout ---------- */
     r = await call('POST', '/api/password', { old: 'wrong-password', new: 'another-pass-123' });
@@ -417,6 +501,21 @@ function readZip(buf) {
     check('old password no longer works', r.status === 401, r.status);
     r = await call('POST', '/api/login', { password: PW2 }, { noCookie: true });
     check('new password signs in', r.status === 200, r.status);
+    const sessionsBefore = (await db.get('SELECT COUNT(*) AS n FROM sessions')).n;
+    check('sessions live in the database, not in memory', sessionsBefore >= 1 && (await db.get("SELECT COUNT(*) AS n FROM settings WHERE key = 'password_hash'")).n === 1, sessionsBefore);
+    resetSchemaFlag();
+    check('a fresh server instance still knows the session (nothing is kept in memory)', (await call('GET', '/api/leads?limit=1')).status === 200, 1);
+    const plain = await fetch(BASE + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: PW2 }) });
+    const plainCookie = plain.headers.getSetCookie()[0] || '';
+    check('over plain http (local tries) the cookie is HttpOnly and SameSite=Strict', /HttpOnly/.test(plainCookie) && /SameSite=Strict/.test(plainCookie) && !/Secure/.test(plainCookie), plainCookie);
+    const secure = await fetch(BASE + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-Proto': 'https' }, body: JSON.stringify({ password: PW2 }) });
+    const secureCookie = secure.headers.getSetCookie()[0] || '';
+    check('behind https (Vercel) the session cookie is Secure, HttpOnly, SameSite=Strict and lasts 30 days', /; Secure/.test(secureCookie) && /HttpOnly/.test(secureCookie) && /SameSite=Strict/.test(secureCookie) && /Max-Age=2592000/.test(secureCookie) && /Path=\//.test(secureCookie), secureCookie);
+    const out = await fetch(BASE + '/api/logout', { method: 'POST', headers: { 'X-Forwarded-Proto': 'https', Cookie: secureCookie.split(';')[0] } });
+    check('signing out clears the cookie with the same flags', /Max-Age=0/.test(out.headers.getSetCookie()[0] || '') && /; Secure/.test(out.headers.getSetCookie()[0] || ''), out.headers.getSetCookie());
+    cookie = '';
+    r = await call('POST', '/api/login', { password: PW2 }, { noCookie: true });
+    check('signing in again works', r.status === 200 && cookie.startsWith('sid='), r.status);
 
     /* ---------- big import ---------- */
     const big = Array.from({ length: 2000 }, (_, i) => ({ business_name: 'Bulk Co ' + i, phone: '(555) 7' + String(i).padStart(2, '0') + '-' + String(1000 + i), city: 'Bulkville', state: 'TX', trade: 'Roofer' }));
@@ -439,14 +538,18 @@ function readZip(buf) {
     let last = 0;
     for (let i = 0; i < 7; i++) last = (await call('POST', '/api/login', { password: 'nope-' + i }, { noCookie: true })).status;
     check('repeated wrong passwords get locked out (429)', last === 429, last);
+    check('the lockout is kept in the database, so it holds across serverless instances', (await db.get("SELECT COUNT(*) AS n FROM login_attempts WHERE ip NOT LIKE 'setup|%'")).n >= 6, 1);
+    resetSchemaFlag();
+    check('while locked out even the right password is refused', (await call('POST', '/api/login', { password: PW2 }, { noCookie: true })).status === 429, 1);
   } catch (e) {
     check('test run crashed', false, e.stack);
   } finally {
-    srv.kill();
+    srv.close(); vercelStyle.close();
     try { mock.close(); } catch (e) { /* ignore */ }
-    if (srvErr.trim()) console.log('\nserver stderr:\n' + srvErr);
+    try { await db.close(); } catch (e) { /* ignore */ }
+    if (pgServer) await pgServer.stop();
     const bad = results.filter((x) => !x.ok);
-    console.log(`\n${results.length - bad.length} passed, ${bad.length} failed. Data dir: ${DATA}`);
+    console.log(`\n${results.length - bad.length} passed, ${bad.length} failed.`);
     process.exit(bad.length ? 1 : 0);
   }
 })();

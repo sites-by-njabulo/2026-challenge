@@ -1,12 +1,26 @@
 {
-  "name": "lead-tracker",
-  "version": "1.0.0",
+  "name": "lead-tracker-cloud",
+  "version": "2.0.0",
   "private": true,
-  "description": "One record per business, every contact attempt on its timeline. No dependencies.",
+  "description": "One record per business, every contact attempt on its timeline. Runs on Vercel with a Supabase Postgres database.",
+  "main": "dev-server.js",
   "scripts": {
-    "start": "node --no-warnings server.js",
+    "start": "node --no-warnings dev-server.js",
     "seed": "node --no-warnings seed.js",
-    "test": "node --no-warnings test/flow.js"
+    "test": "node --no-warnings test/flow.js",
+    "test:ui": "node --no-warnings test/ui.js",
+    "test:pg": "node --no-warnings test/via-pg.js flow && node --no-warnings test/via-pg.js ui",
+    "test:other": "node --no-warnings test/migrate.js && node --no-warnings test/config.js",
+    "test:all": "node --no-warnings test/flow.js && node --no-warnings test/ui.js && node --no-warnings test/via-pg.js flow && node --no-warnings test/via-pg.js ui && node --no-warnings test/migrate.js && node --no-warnings test/config.js"
   },
-  "engines": { "node": ">=22.13" }
+  "dependencies": {
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.6.0",
+    "@electric-sql/pglite-socket": "^0.3.0"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
 }

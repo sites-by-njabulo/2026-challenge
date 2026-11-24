@@ -1,18 +1,25 @@
 'use strict';
 /* Browser test: drives the real screens in Edge via puppeteer-core, takes screenshots, clicks through the main flows.
+   The app runs in this process against an in-process Postgres (PGlite). Nothing outside this process is touched.
+   Also run it with TEST_VIA_PG=1 to go through the production database path (the pg package over a real Postgres connection).
    Run: node --no-warnings test/ui.js    (needs puppeteer-core; path below points at an existing install) */
-const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const puppeteer = require('C:/Users/Admin1/webdesign-landing/My websites/My Projects/Projects/AI Video Editor/tools/node_modules/puppeteer-core');
 
-const ROOT = path.join(__dirname, '..');
 const SHOTS = path.join(__dirname, 'shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 const PORT = 4398, BASE = 'http://127.0.0.1:' + PORT;
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-ui-'));
 const PW = 'ui-test-' + Math.random().toString(36).slice(2, 10);
+const SETUP_TOKEN = 'setup-' + Math.random().toString(36).slice(2, 12);
+delete process.env.DATABASE_URL;
+Object.assign(process.env, { TEST_PGLITE: '1', APP_SECRET: 'ui-test-app-secret-' + Math.random().toString(36).slice(2, 14), SETUP_TOKEN, CRON_SECRET: 'ui-test-cron-secret-1234', ZAPMAIL_BASE: 'http://127.0.0.1:4396/api/v3' });
+const { createServer, app } = require('../dev-server.js');
+const { seed } = require('../seed.js');
+const db = app.db;
+let pgServer = null;
 const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const results = [];
 const check = (name, cond, extra) => { results.push({ name, ok: !!cond }); console.log((cond ? 'PASS ' : 'FAIL ') + name + (cond ? '' : '  <-- ' + JSON.stringify(extra))); };
@@ -20,11 +27,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 Eastern, 17:30 Hawaii: some leads open, some closed
 
 (async () => {
-  spawnSync(process.execPath, ['--no-warnings', 'seed.js'], { cwd: ROOT, env: { ...process.env, DATA_DIR: DATA } });
+  if (process.env.TEST_VIA_PG === '1') {
+    pgServer = await require('./pg-server.js').startPgServer(5438);
+    delete process.env.TEST_PGLITE;
+    process.env.DATABASE_URL = pgServer.url;
+    process.env.DATABASE_SSL = 'off';
+  }
+  await seed();
+  check('the database engine is the one this run is meant to test (' + (pgServer ? 'pg, the production path' : 'PGlite') + ')', db.kind() === (pgServer ? 'pg' : 'pglite'), db.kind());
   const ZM_KEY = '1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed';
   const mock = await require('./zapmail-mock.js').startMock(4396, ZM_KEY);
-  const srv = spawn(process.execPath, ['--no-warnings', 'server.js'], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DATA_DIR: DATA, ZAPMAIL_BASE: 'http://127.0.0.1:4396/api/v3' }, stdio: 'ignore' });
-  for (let i = 0; i < 40; i++) { try { if ((await fetch(BASE + '/api/health')).ok) break; } catch (e) { /* wait */ } await sleep(150); }
+  const srv = createServer();
+  await new Promise((resolve) => srv.listen(PORT, '127.0.0.1', resolve));
   const browser = await puppeteer.launch({ executablePath: EDGE, headless: 'new', args: ['--no-sandbox'] });
   const errors = [];
   try {
@@ -52,8 +66,15 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
     await wait('#pw');
     check('first run shows the set-password screen', (await page.$eval('h1', (h) => h.textContent)).includes('Set a password'), 1);
+    check('first run also asks for the setup code, and the code box hides what you type', await page.evaluate(() => { const c = document.querySelector('#setup-code'); return !!c && c.type === 'password' && /Setup code/.test(document.body.textContent); }), 1);
     await shot('01-setup');
     await page.type('#pw', PW);
+    await page.type('#setup-code', 'wrong-code-1234');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => /setup code is not right/i.test(document.querySelector('.err').textContent), { timeout: 5000 });
+    check('a wrong setup code is refused with a plain message and nothing is set', await page.evaluate(() => !!document.querySelector('#setup-code')), 1);
+    await page.$eval('#setup-code', (e) => { e.value = ''; });
+    await page.type('#setup-code', SETUP_TOKEN);
     await page.keyboard.press('Enter');
     await wait('#app');
     check('the navigation is Today, Calls, Leads, Pipeline, Email, Stats with Settings at the foot', await page.evaluate(() => [...document.querySelectorAll('.nav a')].map((a) => a.textContent.trim()).join('|') === 'Today|Calls|Leads|Pipeline|Email|Stats' && !!document.querySelector('.rail-foot a[href="#/settings"]')), 1);
@@ -322,6 +343,11 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     await sleep(300);
     await shot('14-lead-desktop');
 
+    await page.goto(BASE + '/#/settings');
+    await wait('#s-script');
+    const setText = await page.evaluate(() => document.body.textContent);
+    check('Settings: Export and Backups say the data lives in Supabase, Supabase keeps its own backups, and a copy can be downloaded', /Your data lives in your Supabase database/.test(setText) && /Supabase keeps its own backups/.test(setText) && !/data\/backups|this computer|Back up now/.test(setText) && (await page.$$('a[href="/api/export/all.zip"]')).length >= 2, setText.slice(0, 80));
+
     /* ---------- Email page (Zapmail snapshot) ---------- */
     await page.goto(BASE + '/#/email');
     await wait('.banner.warn');
@@ -366,11 +392,28 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     const live = await page.evaluate(() => ({ text: document.body.textContent, rows: [...document.querySelectorAll('table.t tbody tr')].map((r) => r.textContent) }));
     check('after connecting, the page shows the key ending, not the key', /Connected with the key ending/.test(live.text) && live.text.includes('\u00b7\u00b7\u00b7\u00b7' + ZM_KEY.slice(-4)) && !live.text.includes(ZM_KEY), 1);
     check('the mailboxes now come from Zapmail with scores out of 100', live.rows.some((t) => /jay@mock-one\.test/.test(t) && /60\/100/.test(t)) && live.rows.some((t) => /jay@mock-two\.test/.test(t) && /No score yet/.test(t)), live.rows.slice(0, 4));
-    check('it says the numbers are live from the API', /Live from the Zapmail API/.test(live.text) && /refreshes by itself every 3 hours/.test(live.text), 1);
+    check('it says the numbers are live from the API', /Live from the Zapmail API/.test(live.text) && /refreshes by itself once a day/.test(live.text), 1);
     await clickText('Refresh now', 'button');
     await sleep(1500);
     check('Refresh now pulls fresh numbers and says so', await page.evaluate(() => [...document.querySelectorAll('.toast')].some((t) => /Updated from Zapmail: 3 mailboxes/.test(t.textContent))), 1);
     await sleep(900);
+    /* numbers more than 30 minutes old refresh themselves when the Email page opens */
+    await db.run("INSERT INTO settings(key, value) VALUES('zapmail_last_sync', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", new Date(Date.now() - 2 * 3600000).toISOString());
+    const callsBefore = mock.calls.length;
+    await page.goto(BASE + '/#/calls');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.seg');
+    await page.click('.nav a[data-nav="email"]');
+    await page.waitForFunction(() => /Connected/.test(document.body.textContent), { timeout: 8000 });
+    await sleep(2500);
+    check('opening the Email page with numbers over 30 minutes old refreshes them by itself', mock.calls.length >= callsBefore + 3, [callsBefore, mock.calls.length]);
+    const lastSyncAge = await page.evaluate(async () => { const z = await (await fetch('/api/zapmail/status')).json(); return z.age_minutes; });
+    check('and the last refresh time is now fresh again', lastSyncAge !== null && lastSyncAge <= 1, lastSyncAge);
+    const callsMid = mock.calls.length;
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await wait('.tiles');
+    await sleep(1500);
+    check('fresh numbers are not refreshed again just for opening the page', mock.calls.length === callsMid, [callsMid, mock.calls.length]);
     await page.click('#ck-address');
     await sleep(600);
     await page.reload({ waitUntil: 'domcontentloaded' });
@@ -378,7 +421,7 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
     check('a ticked item on the pre-send checklist is remembered', await page.$eval('#ck-address', (c) => c.checked), 1);
     await page.goto(BASE + '/#/leads');
     await wait('table.t');
-    await page.evaluate(() => { document.querySelector('table.t tbody tr').click(); });
+    await page.evaluate(() => { [...document.querySelectorAll('table.t tbody tr')].find((r) => !r.querySelector('.optout')).click(); });
     await page.waitForFunction(() => location.hash.startsWith('#/lead/'), { timeout: 5000 });
     await wait('.lead-grid');
     await clickText('Email', '.seg button');
@@ -422,7 +465,9 @@ const FIXED_NOW = process.env.FIXED_NOW || '2026-11-25T03:30:00Z'; // 22:30 East
   } finally {
     await browser.close();
     try { mock.close(); } catch (e) { /* ignore */ }
-    srv.kill();
+    srv.close();
+    try { await db.close(); } catch (e) { /* ignore */ }
+    if (pgServer) await pgServer.stop();
     const bad = results.filter((x) => !x.ok);
     console.log(`\n${results.length - bad.length} passed, ${bad.length} failed. Screenshots in ${SHOTS}`);
     process.exit(bad.length ? 1 : 0);

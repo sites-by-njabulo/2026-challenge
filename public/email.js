@@ -23,9 +23,9 @@ function connectPanel(zs, reload) {
     const refresh = h('button', { class: 'btn ghost sm', type: 'button' }, 'Refresh now');
     refresh.addEventListener('click', async () => { refresh.setAttribute('disabled', ''); err.textContent = ''; try { const r = await api('POST', '/api/zapmail/sync'); toast('Updated from Zapmail: ' + r.mailboxes + ' mailboxes'); await reload(); } catch (e) { err.textContent = e.message; refresh.removeAttribute('disabled'); } });
     const off = h('button', { class: 'btn danger sm', type: 'button' }, 'Disconnect');
-    off.addEventListener('click', async () => { if (!(await confirmDialog({ title: 'Disconnect Zapmail?', message: 'The saved key is deleted from this computer. Your Zapmail account is not touched, and the last numbers stay on this page.', confirmLabel: 'Disconnect', danger: true }))) return; await api('DELETE', '/api/zapmail/key'); toast('Disconnected'); await reload(); });
+    off.addEventListener('click', async () => { if (!(await confirmDialog({ title: 'Disconnect Zapmail?', message: 'The saved key is deleted from this tracker. Your Zapmail account is not touched, and the last numbers stay on this page.', confirmLabel: 'Disconnect', danger: true }))) return; await api('DELETE', '/api/zapmail/key'); toast('Disconnected'); await reload(); });
     return h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, 'Zapmail connection'), h('span', { class: 'chip flat ok' }, 'Connected')),
-      h('p', { style: 'padding-top:14px;max-width:640px' }, 'Connected with the key ending ', h('span', { class: 'mono' }, '\u00b7\u00b7\u00b7\u00b7' + zs.key_hint), '. It refreshes by itself every 3 hours.', zs.last_sync ? ' Last refresh ' + ago(zs.last_sync) + '.' : ''),
+      h('p', { style: 'padding-top:14px;max-width:640px' }, 'Connected with the key ending ', h('span', { class: 'mono' }, '\u00b7\u00b7\u00b7\u00b7' + zs.key_hint), '. It refreshes by itself once a day, when you open this page and the numbers are more than 5 minutes old, and every 5 minutes while this page is open. You never have to press Refresh.', zs.last_sync ? ' Last refresh ' + ago(zs.last_sync) + '.' : ''),
       zs.last_error ? h('div', { class: 'banner warn', style: 'margin-top:12px;max-width:640px' }, icon('alert'), h('div', null, zs.last_error)) : null,
       h('div', { class: 'actions', style: 'padding-top:12px' }, refresh, off), err,
       h('p', { class: 'hint', style: 'margin-top:14px;max-width:640px' }, 'This app only ever asks Zapmail for three read-only lists: mailboxes, domains and warm-up scores. It cannot buy, change or delete anything in Zapmail.'));
@@ -42,9 +42,12 @@ function connectPanel(zs, reload) {
       h('li', null, 'Copy the key and paste it below. It looks like 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed.'),
       h('li', null, 'Press Connect. This page fills with live numbers and then refreshes itself.')),
     h('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;align-items:center;padding-top:14px' }, h('label', { for: 'zm-key', class: 'sr-only' }, 'Zapmail API key'), key, go), err,
-    h('div', { class: 'banner warn', style: 'margin-top:16px;max-width:660px' }, icon('alert'), h('div', null, h('strong', null, 'Treat the key like a password. '), 'Zapmail keys cannot be limited to read only, so the same key could also buy things in Zapmail. This app only calls three read lists, saves the key encrypted on this computer, and never shows it again. If it ever leaks, delete it in Zapmail and make a new one.')),
+    h('div', { class: 'banner warn', style: 'margin-top:16px;max-width:660px' }, icon('alert'), h('div', null, h('strong', null, 'Treat the key like a password. '), 'Zapmail keys cannot be limited to read only, so the same key could also buy things in Zapmail. This app only calls three read lists, saves the key encrypted in your database, and never shows it again. If it ever leaks, delete it in Zapmail and make a new one.')),
     h('p', { class: 'hint', style: 'margin-top:12px;max-width:660px' }, 'If Zapmail answers "not enabled", API access is switched off on your account. Ask support@zapmail.ai to enable it. Until then Claude can still fill this page by reading your dashboard: ask "update my Zapmail numbers".'));
 }
+
+let lastAutoTry = 0;
+let pollTimer = null;
 
 export async function renderEmail(view) {
   let d, zs;
@@ -76,10 +79,11 @@ export async function renderEmail(view) {
       d.stale ? (zs.connected ? 'Press Refresh now under Zapmail connection.' : 'Connect Zapmail below, or ask Claude: "update my Zapmail numbers".') : (/API/.test(snap.source || '') ? 'Live from the Zapmail API.' : 'Read from the Zapmail dashboard by Claude.'))));
 
   /* tiles */
-  const score = d.score_now == null ? 'n/a' : d.score_now.toFixed(1) + '/' + (mailboxes[0] ? mailboxes[0].score_max || 5 : 5);
+  const noScores = mailboxes.length > 0 && mailboxes.every((m) => m.score == null);
+  const score = d.score_now == null ? 'None yet' : d.score_now.toFixed(1) + '/' + (mailboxes[0] ? mailboxes[0].score_max || 5 : 5);
   const trend = d.score_before != null && d.score_now != null ? (d.score_now > d.score_before ? 'up from ' + d.score_before.toFixed(1) : d.score_now < d.score_before ? 'down from ' + d.score_before.toFixed(1) : 'unchanged') : '';
   out.push(h('div', { class: 'tiles' },
-    ...[[mailboxes.length, 'Mailboxes'], [warming, 'Warming up'], [score, 'Average score', trend], [z.emails_sent_30d != null ? z.emails_sent_30d : 'n/a', 'Warm-up emails, 30 days'], [z.inbox_rate != null ? pct(z.inbox_rate) : 'n/a', 'Landed in inbox']]
+    ...[[mailboxes.length, 'Mailboxes'], [warming, 'Warming up'], [score, 'Average score', noScores ? 'Zapmail has not scored them yet' : trend], [z.emails_sent_30d != null ? z.emails_sent_30d : 'n/a', 'Warm-up emails, 30 days'], [z.inbox_rate != null ? pct(z.inbox_rate) : 'n/a', 'Landed in inbox']]
       .map(([n, l, sub]) => h('div', { class: 'tile' }, h('div', { class: 'n' }, n), h('div', { class: 'l' }, l), sub ? h('div', { class: 'hint' }, sub) : null))));
 
   /* mailboxes by domain */
@@ -98,6 +102,7 @@ export async function renderEmail(view) {
           h('td', { class: 'r', 'data-label': 'Warm-up sent' }, m.sent_30d == null ? '' : m.sent_30d),
           h('td', { class: 'r', 'data-label': 'Inbox' }, m.inbox_rate == null ? '' : pct(m.inbox_rate)),
           h('td', { class: 'r', 'data-label': 'Cold sent today' }, (d.per_mailbox_today[m.email] || 0) + ' / ' + limit)))])))),
+    noScores ? h('div', { class: 'banner', style: 'margin-top:12px;max-width:700px' }, icon('alert'), h('div', null, h('strong', null, 'No warm-up score yet. '), 'That is Zapmail, not this page. Warm-up started on ' + fmtDay(r ? r.started : z.started) + ' and Zapmail only gives a score after the first days of warm-up. Until then, the real signs are the Warm-up sent and Inbox columns: every warm-up email so far has landed in the inbox. The score fills in here by itself.')) : null,
     h('p', { class: 'hint', style: 'margin-top:8px' }, 'Warm-up emails go between your mailboxes and Zapmail\'s own network. They are not cold emails and never reach a lead. Cold emails come from the log: pick "Sent from" when you log an email on a lead.')));
 
   /* sending plan */
@@ -155,6 +160,24 @@ export async function renderEmail(view) {
   out.push(connectPanel(zs, reload));
 
   body.replaceChildren(...out);
+
+  /* connected: keep the numbers fresh by themselves. On opening, if they are more than 5 minutes old;
+     then every 5 minutes while this page stays open (the timer stops once you leave the page). */
+  clearTimeout(pollTimer);
+  if (zs.connected) {
+    pollTimer = setTimeout(async () => {
+      if (!body.isConnected) return;
+      try { await api('POST', '/api/zapmail/sync'); } catch (e) { /* the last good numbers stay on screen */ }
+      if (body.isConnected) await reload();
+    }, 5 * 60000);
+    const age = zs.age_minutes == null ? Infinity : zs.age_minutes;
+    if (age > 5 && Date.now() - lastAutoTry > 5 * 60000) {
+      lastAutoTry = Date.now();
+      const note = h('p', { class: 'hint', id: 'zm-refreshing', 'aria-live': 'polite' }, 'Refreshing from Zapmail...');
+      body.prepend(note);
+      api('POST', '/api/zapmail/sync').then(() => reload()).catch(() => { note.remove(); });
+    }
+  }
 
   async function load() { await reload(); }
 }

@@ -1,4 +1,4 @@
-import { h, Lib, icon, api, toast, confirmDialog, fmtDateTime, state } from './ui.js';
+import { h, Lib, icon, api, toast, confirmDialog, state } from './ui.js';
 
 const TZ_OPTIONS = ['Africa/Johannesburg', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'Europe/London', 'UTC'];
 
@@ -20,15 +20,6 @@ export async function renderSettings(view, ctx) {
     try { state.settings = await api('PUT', '/api/settings', body); toast(msg || 'Saved'); } catch (e) { toast(e.message, { error: true }); }
   }
 
-  const backupList = h('div', { class: 'muted small' }, 'Loading backups');
-  async function loadBackups() {
-    try {
-      const r = await api('GET', '/api/backups');
-      backupList.replaceChildren(r.backups.length ? h('ul', { class: 'ledger' }, ...r.backups.slice(0, 8).map((b) => h('li', { class: 'row nolamp', style: 'grid-template-columns:1fr auto;padding:9px 0' }, h('span', { class: 'mono small' }, b.name), h('span', { class: 'muted small' }, fmtDateTime(b.at) + ' · ' + Math.round(b.bytes / 1024) + ' KB')))) : 'No backups yet.');
-    } catch (e) { backupList.textContent = e.message; }
-  }
-  loadBackups();
-
   const sec = (title, ...kids) => h('section', { class: 'section' }, h('div', { class: 'sec-head' }, h('h2', null, title)), h('div', { style: 'display:grid;gap:14px;padding-top:16px;max-width:620px' }, ...kids));
   view.append(
     h('div', { class: 'page-head' }, h('div', null, h('h1', null, 'Settings'))),
@@ -42,11 +33,11 @@ export async function renderSettings(view, ctx) {
       h('div', null, h('button', { class: 'btn', type: 'button', onclick: () => save({ my_timezone: tz, call_window_start: w0, call_window_end: w1 }, 'Saved') }, 'Save'))),
     sec('Call script', fld('s-script', 'Shown next to every lead', script, 'Keep your hook, the question, and what to say if they say no.'),
       h('div', null, h('button', { class: 'btn', type: 'button', onclick: () => save({ call_script: script }, 'Script saved') }, 'Save script'))),
-    sec('Export', h('p', { class: 'hint' }, 'Your data lives in one file on this computer. Export anytime.'),
+    sec('Export', h('p', { class: 'hint' }, 'Your data lives in your Supabase database. Export anytime.'),
       h('div', { class: 'actions' }, h('a', { class: 'btn', href: '/api/export/all.zip', download: '' }, icon('download', 18), 'Everything (zip of CSVs)'),
         ...['leads', 'contacts', 'deals', 'opt_outs'].map((n) => h('a', { class: 'btn ghost sm', href: '/api/export/' + n + '.csv', download: '' }, n.replace('_', '-') + '.csv')))),
-    sec('Backups', h('p', { class: 'hint' }, 'A backup is made when the server starts, every 3 hours, and after each import. The newest 60 are kept in the data/backups folder.'),
-      h('div', null, h('button', { class: 'btn ghost', type: 'button', onclick: async () => { try { await api('POST', '/api/backups/run'); toast('Backup saved'); loadBackups(); } catch (e) { toast(e.message, { error: true }); } } }, 'Back up now')), backupList),
+    sec('Backups', h('p', { class: 'hint' }, 'Nothing is saved on a computer any more. Your leads live in your Supabase database, and Supabase keeps its own backups (how many days depends on your Supabase plan, see Project Settings, Database, Backups). The export above is your own copy: download the zip now and then and keep it somewhere safe.'),
+      h('div', null, h('a', { class: 'btn ghost', href: '/api/export/all.zip', download: '' }, icon('download', 18), 'Download a copy now'))),
     sec('Password', passwordForm()),
     sec('Demo data', h('p', { class: 'hint' }, 'Demo leads are marked with a Demo tag. Delete them all before you start with real leads.'),
       h('div', null, h('button', { class: 'btn danger', type: 'button', onclick: async () => {

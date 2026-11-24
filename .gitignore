@@ -1,12 +1,16 @@
-# your leads, backups and the key that encrypts saved secrets: never in git
-data/
-.secret
-*.db
-*.db-wal
-*.db-shm
-*.log
+# secrets and local settings: never in git
+.env
+.env.*
+!.env.example
+.vercel/
+
+# installed packages (Vercel installs them itself)
 node_modules/
 
-# test screenshots and real Zapmail snapshots (they hold your real mailbox addresses)
+# test screenshots, local test databases, logs
 test/shots/
+.pglite/
+*.log
+
+# a real Zapmail snapshot holds your real mailbox addresses
 scripts/zapmail-snapshot-*.json

@@ -22,15 +22,17 @@ function renderAuth(me) {
   booted = false;
   if (cleanup) { cleanup(); cleanup = null; }
   const setup = me.setup_needed;
-  const pw = h('input', { class: 'input', id: 'pw', type: 'password', autocomplete: setup ? 'new-password' : 'current-password', required: true, autofocus: true });
+  const pw = h('input', { class: 'input', id: 'pw', type: 'password', autocomplete: setup ? 'new-password' : 'current-password', required: true, autofocus: !setup });
+  const code = setup ? h('input', { class: 'input', id: 'setup-code', type: 'password', autocomplete: 'off', spellcheck: 'false', required: true, autofocus: true }) : null;
   const err = h('div', { class: 'err', role: 'alert' });
   const btn = h('button', { class: 'btn', type: 'submit' }, setup ? 'Set password' : 'Sign in');
   const form = h('form', { onsubmit: async (e) => {
     e.preventDefault(); err.textContent = ''; btn.setAttribute('disabled', '');
-    try { await api('POST', setup ? '/api/setup' : '/api/login', { password: pw.value }); await boot(); } catch (ex) { err.textContent = ex.message; btn.removeAttribute('disabled'); pw.select(); }
+    try { await api('POST', setup ? '/api/setup' : '/api/login', setup ? { password: pw.value, setup_token: code.value } : { password: pw.value }); await boot(); } catch (ex) { err.textContent = ex.message; btn.removeAttribute('disabled'); pw.select(); }
   } }, brand(),
   h('h1', { style: 'font-size:22px' }, setup ? 'Set a password' : 'Sign in'),
-  setup ? h('p', { class: 'muted' }, 'First time here. Choose a password of 8 or more characters. Your leads stay on this computer.') : null,
+  setup ? h('p', { class: 'muted' }, 'First time here. Choose a password of 8 or more characters. Your leads are saved in your own database. Type the setup code you added in Vercel (SETUP_TOKEN) so only you can do this step.') : null,
+  setup ? h('div', { class: 'field' }, h('label', { for: 'setup-code' }, 'Setup code'), code) : null,
   h('div', { class: 'field' }, h('label', { for: 'pw' }, 'Password'), pw), err, btn);
   root.replaceChildren(h('div', { class: 'auth' }, form));
 }

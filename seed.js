@@ -1,13 +1,11 @@
 'use strict';
 /* Adds 10 fake demo leads (clearly tagged Demo) with a little history, so every screen has something to show.
    Run: node --no-warnings seed.js        (add --force to seed again)
+   Needs DATABASE_URL in the environment (the same Supabase string the site uses).
    Delete them later in Settings > Demo data. */
-const S = require('./server.js');
+const S = require('./src/app');
 const Lib = require('./public/lib.js');
 const { db } = S;
-
-const existing = db.prepare('SELECT COUNT(*) AS n FROM leads WHERE is_demo = 1').get().n;
-if (existing && !process.argv.includes('--force')) { console.log('Demo leads already exist (' + existing + '). Use --force to add again.'); process.exit(0); }
 
 const day = (offsetDays, hour, min) => {
   const d = new Date(); d.setUTCDate(d.getUTCDate() + offsetDays); d.setUTCHours(hour, min || 0, 0, 0); return d.toISOString();
@@ -24,43 +22,58 @@ const LEADS = [
   { business_name: 'Lakeshore Gutters', owner_name: '', phone: '(312) 555-0150', website: 'lakeshoregutters.example', city: 'Chicago', state: '', trade: 'Roofer', source: 'other', batch: 'Demo roofers', notes: 'No state on purpose: shows the "needs a time zone" case.' },
   { business_name: 'Granite Peak HVAC', owner_name: 'Wes Lindqvist', phone: '(801) 555-0188', email: 'wes@granitepeakhvac.example', website: 'granitepeakhvac.example', city: 'Salt Lake City', state: 'UT', trade: 'HVAC', source: 'facebook_group', source_link: 'https://facebook.example/groups/hvac/posts/9', batch: 'Demo HVAC' },
 ];
-const ids = {};
-for (const l of LEADS) {
-  const f = S.normaliseLead({ ...l, is_demo: true }, { status: 'new', source: 'other' });
-  ids[l.business_name] = S.insertLead(f);
+
+/* Seeds the demo leads. Returns how many were added (0 if they already exist and force is off). */
+async function seed(opts) {
+  const force = !!(opts && opts.force);
+  await S.init();
+  const existing = (await db.get('SELECT COUNT(*) AS n FROM leads WHERE is_demo = 1')).n;
+  if (existing && !force) return { added: 0, existing };
+  const ids = {};
+  for (const l of LEADS) {
+    const f = S.normaliseLead({ ...l, is_demo: true }, { status: 'new', source: 'other' });
+    ids[l.business_name] = await S.insertLead(f);
+  }
+  const log = (name, channel, outcome, at, content, extra) => S.addContact(ids[name], { channel, outcome, at, content, ...(extra || {}) });
+
+  // Ridgeline: call + IG DM, reply
+  await log('Ridgeline Roofing', 'call', 'gatekeeper', day(-5, 15, 10), 'Asked for Dale, gatekeeper said call back after 3.');
+  await log('Ridgeline Roofing', 'instagram_dm', 'sent', day(-4, 9, 30), 'Roses are red... DM sent.');
+  await log('Ridgeline Roofing', 'instagram_dm', 'replied', day(-3, 12, 5), 'Sure, send it over.');
+  // Copperfield: FB group comment, FB DM
+  await log('Copperfield Plumbing', 'facebook_group', 'posted', day(-6, 17, 0), 'Answered their question about Google reviews.');
+  await log('Copperfield Plumbing', 'facebook_dm', 'sent', day(-2, 16, 20), 'Sent the opener.');
+  // Sunbelt: calls, spoke to owner, proposal
+  await log('Sunbelt Air & Heating', 'call', 'no_answer', day(-7, 16, 0));
+  await log('Sunbelt Air & Heating', 'call', 'spoke_to_owner', day(-3, 17, 15), 'Talked about being #4 on Maps, he wants a proposal.');
+  await S.putDeal(ids['Sunbelt Air & Heating'], { proposal_sent_date: Lib.dayKey(new Date(Date.now() - 86400000), 'Africa/Johannesburg'), deal_value: 1000 });
+  // Bayview: closed
+  await log('Bayview HVAC', 'instagram_dm', 'sent', day(-12, 14, 0));
+  await log('Bayview HVAC', 'instagram_dm', 'replied', day(-11, 10, 0), 'Yes please.');
+  await log('Bayview HVAC', 'call', 'booked', day(-9, 18, 0), 'Booked a Tuesday call.');
+  await S.putDeal(ids['Bayview HVAC'], { call_at: day(-8, 19, 0), call_result: 'show', proposal_sent_date: Lib.dayKey(new Date(Date.now() - 7 * 86400000), 'Africa/Johannesburg'), deposit_paid_date: Lib.dayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg'), deposit_amount: 500, signed_date: Lib.dayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg'), deal_value: 1000 });
+  // Harbor Light, Northwind and Lakeshore stay untouched (status New) so the call queue has people in it
+  // Granite Peak: booked call in the future
+  await log('Granite Peak HVAC', 'facebook_dm', 'replied', day(-2, 11, 0), 'Works for me, call tomorrow.');
+  await log('Granite Peak HVAC', 'call', 'booked', day(-1, 17, 0), 'Booked for the day after tomorrow.');
+  await S.putDeal(ids['Granite Peak HVAC'], { call_at: day(2, 16, 0), call_result: 'pending', deal_value: 1500 });
+  // Prairie State: opted out
+  await log('Prairie State Roofing', 'email', 'sent', day(-6, 15, 0), 'First email.');
+  await log('Prairie State Roofing', 'email', 'replied', day(-5, 9, 0), 'Please take me off your list.');
+  await S.optOut(ids['Prairie State Roofing'], { channel: 'all', note: 'Replied to the email asking to be removed.', at: day(-5, 9, 5) });
+  // Palm Coast: a couple of stale attempts so follow-ups are overdue
+  await log('Palm Coast Pressure Washing', 'instagram_dm', 'sent', day(-9, 8, 0), 'Opener sent.');
+  await db.run('UPDATE leads SET next_followup = ? WHERE id = ?', Lib.addDaysKey(Lib.dayKey(new Date(), 'Africa/Johannesburg'), -3), ids['Palm Coast Pressure Washing']);
+
+  const todayKey = Lib.dayKey(new Date(), 'Africa/Johannesburg');
+  await db.run('UPDATE leads SET next_followup = ? WHERE id IN (?, ?)', todayKey, ids['Copperfield Plumbing'], ids['Sunbelt Air & Heating']);
+  return { added: LEADS.length, existing: 0 };
 }
-const log = (name, channel, outcome, at, content, extra) => S.addContact(ids[name], { channel, outcome, at, content, ...(extra || {}) });
 
-// Ridgeline: call + IG DM, reply
-log('Ridgeline Roofing', 'call', 'gatekeeper', day(-5, 15, 10), 'Asked for Dale, gatekeeper said call back after 3.');
-log('Ridgeline Roofing', 'instagram_dm', 'sent', day(-4, 9, 30), 'Roses are red... DM sent.');
-log('Ridgeline Roofing', 'instagram_dm', 'replied', day(-3, 12, 5), 'Sure, send it over.');
-// Copperfield: FB group comment, FB DM
-log('Copperfield Plumbing', 'facebook_group', 'posted', day(-6, 17, 0), 'Answered their question about Google reviews.');
-log('Copperfield Plumbing', 'facebook_dm', 'sent', day(-2, 16, 20), 'Sent the opener.');
-// Sunbelt: calls, spoke to owner, proposal
-log('Sunbelt Air & Heating', 'call', 'no_answer', day(-7, 16, 0));
-log('Sunbelt Air & Heating', 'call', 'spoke_to_owner', day(-3, 17, 15), 'Talked about being #4 on Maps, he wants a proposal.');
-S.putDeal(ids['Sunbelt Air & Heating'], { proposal_sent_date: Lib.dayKey(new Date(Date.now() - 86400000), 'Africa/Johannesburg'), deal_value: 1000 });
-// Bayview: closed
-log('Bayview HVAC', 'instagram_dm', 'sent', day(-12, 14, 0));
-log('Bayview HVAC', 'instagram_dm', 'replied', day(-11, 10, 0), 'Yes please.');
-log('Bayview HVAC', 'call', 'booked', day(-9, 18, 0), 'Booked a Tuesday call.');
-S.putDeal(ids['Bayview HVAC'], { call_at: day(-8, 19, 0), call_result: 'show', proposal_sent_date: Lib.dayKey(new Date(Date.now() - 7 * 86400000), 'Africa/Johannesburg'), deposit_paid_date: Lib.dayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg'), deposit_amount: 500, signed_date: Lib.dayKey(new Date(Date.now() - 5 * 86400000), 'Africa/Johannesburg'), deal_value: 1000 });
-// Harbor Light, Northwind and Lakeshore stay untouched (status New) so the call queue has people in it
-// Granite Peak: booked call in the future
-log('Granite Peak HVAC', 'facebook_dm', 'replied', day(-2, 11, 0), 'Works for me, call tomorrow.');
-log('Granite Peak HVAC', 'call', 'booked', day(-1, 17, 0), 'Booked for the day after tomorrow.');
-S.putDeal(ids['Granite Peak HVAC'], { call_at: day(2, 16, 0), call_result: 'pending', deal_value: 1500 });
-// Prairie State: opted out
-log('Prairie State Roofing', 'email', 'sent', day(-6, 15, 0), 'First email.');
-log('Prairie State Roofing', 'email', 'replied', day(-5, 9, 0), 'Please take me off your list.');
-S.optOut(ids['Prairie State Roofing'], { channel: 'all', note: 'Replied to the email asking to be removed.', at: day(-5, 9, 5) });
-// Palm Coast: a couple of stale attempts so follow-ups are overdue
-log('Palm Coast Pressure Washing', 'instagram_dm', 'sent', day(-9, 8, 0), 'Opener sent.');
-db.prepare("UPDATE leads SET next_followup = ? WHERE id = ?").run(Lib.addDaysKey(Lib.dayKey(new Date(), 'Africa/Johannesburg'), -3), ids['Palm Coast Pressure Washing']);
+module.exports = { seed, LEADS };
 
-const todayKey = Lib.dayKey(new Date(), 'Africa/Johannesburg');
-db.prepare('UPDATE leads SET next_followup = ? WHERE id IN (?, ?)').run(todayKey, ids['Copperfield Plumbing'], ids['Sunbelt Air & Heating']);
-console.log('Seeded ' + LEADS.length + ' demo leads into ' + S.DATA_DIR);
-db.close();
+if (require.main === module) {
+  seed({ force: process.argv.includes('--force') })
+    .then(async (r) => { console.log(r.added ? 'Seeded ' + r.added + ' demo leads.' : 'Demo leads already exist (' + r.existing + '). Use --force to add again.'); await db.close(); })
+    .catch(async (e) => { console.error(e.message); await db.close(); process.exit(1); });
+}
