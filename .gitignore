@@ -1,0 +1,12 @@
+# your leads, backups and the key that encrypts saved secrets: never in git
+data/
+.secret
+*.db
+*.db-wal
+*.db-shm
+*.log
+node_modules/
+
+# test screenshots and real Zapmail snapshots (they hold your real mailbox addresses)
+test/shots/
+scripts/zapmail-snapshot-*.json
